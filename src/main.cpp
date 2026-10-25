@@ -1,4 +1,4 @@
-// Passiver WLAN-Intrusion-Detector — Waveshare ESP32-C6-LCD-1.47
+// Passiver WLAN-Intrusion-Detector - Waveshare ESP32-C6-LCD-1.47
 // Arduino-Core 3.x (pioarduino). Rein passiv: Promiscuous-RX, Kanal-Hopping.
 // Callback schreibt nur Zähler + Ringpuffer; Auswertung im loop().
 
@@ -222,7 +222,7 @@ static void macToStr(const uint8_t* m, char* out) {
 }
 
 // Heimkanal = erwarteter Kanal einer Whitelist-BSSID oder zuletzt gesehener
-// AP-Kanal — aber nur solange der AP kürzlich gesehen wurde. Sonst wird
+// AP-Kanal - aber nur solange der AP kürzlich gesehen wurde. Sonst wird
 // gesweept (Boot, Autokanal-Wechsel, AP weg).
 static bool isHomeChannel(uint8_t ch) {
     if (!ownBeaconSeen || millis() - lastOwnBeaconMs >= AP_LOST_RESWEEP_MS) return false;
@@ -339,7 +339,7 @@ static void processEvents() {
 static uint32_t lastFlush = 0;
 static bool     deauthThisDwell = false;
 
-// Zähler dem aktuellen Kanal gutschreiben und bewerten — läuft alle
+// Zähler dem aktuellen Kanal gutschreiben und bewerten - läuft alle
 // DEAUTH_EVAL_MS, unabhängig vom Hop (sonst wäre die Regel beim Parken blind).
 static void flushCounters(uint32_t now) {
     const uint32_t t = cntDeauthTotal.exchange(0);
