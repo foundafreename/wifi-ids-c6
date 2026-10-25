@@ -33,6 +33,37 @@ static const ApEntry WHITELIST[] = {
 #define DEAUTH_TOTAL_PER_S   20     // alle BSSIDs
 #define DEAUTH_MINE_PER_S    5      // addr1/2/3 in Whitelist
 #define RATE_WINDOW_MS       1000   // Airtime-Fenster je Kanal
+// Ohne Mindestfenster reichen 5 Frames in 330 ms für "15/s". Ein Router, der
+// beim Rekey 5 Clients auf einmal kickt, sieht dann aus wie ein Angriff.
+#define DEAUTH_MIN_WINDOW_MS 1000   // erst ab so viel Airtime bewerten
+#define DEAUTH_MINE_MIN_FRAMES  8   // und mindestens so viele Frames gegen eigene BSSID
+#define DEAUTH_TOTAL_MIN_FRAMES 20  // bzw. gesamt
+
+// Regel 6: RSSI-Plausibilität. Ein Deauth mit SA = eigene BSSID muss ungefähr
+// so laut ankommen wie die Beacons dieser BSSID. Weicht er stärker ab, hat ihn
+// jemand anderes gesendet. Das Board gehört dafür nah an den Router.
+#define RSSI_SPOOF_DELTA_DB  10
+#define DEAUTH_SPOOF_MIN_FRAMES 3   // so viele gespoofte Frames im Fenster -> ALARM
+// Sind alle Deauths plausibel vom AP (RSSI passt, keine fremden Sender), ist
+// das meist ein Client in der Reconnect-Schleife, kein Angriff. 1 = nur WARN.
+#define DEAUTH_FROM_AP_IS_WARN 1
+
+// Regel 2b: geklonte BSSID. Zwei Sender mit gleicher BSSID haben zwei
+// TSF-Zähler; der Offset Beacon-TSF minus Empfangszeit springt dann hin und
+// her. Dazu ein Hash über die IE-Struktur des Beacons: ein hostapd-Twin
+// reproduziert das IE-Set einer FritzBox nicht.
+#define CHECK_TSF            1
+#define TSF_JUMP_US          3000   // Toleranz: Drift 40 ppm x 22 s Sweep = 0,9 ms, plus Latenz
+#define TSF_JUMPS_FOR_ALARM  3      // so viele Sprünge in TSF_JUMP_WINDOW_MS -> ALARM, einzelner Sprung = WARN (AP-Neustart)
+#define TSF_JUMP_WINDOW_MS   10000
+#define CHECK_IE_HASH        1      // Hash beim ersten Beacon lernen, in NVS merken; Abweichung -> ALARM
+                                    // Nach Router-Update/Konfigänderung: BOOT 3 s halten, dann neu lernen
+
+// Beweis-Log: die letzten Deauths gegen eigene BSSID (SA, DA, Reason, RSSI,
+// Kanal). Wird bei ALARM seriell ausgegeben und in NVS gesichert, beim
+// nächsten Boot wieder ausgegeben. Sonst ist nach einem Reset nichts mehr da.
+#define EVIDENCE_SIZE        16
+#define EVIDENCE_NVS         1
 
 // Regel 3: WPA1-only (Vendor-IE 00:50:F2:01 ohne RSN-IE) als sicher werten?
 #define TREAT_WPA1_AS_SECURE 0

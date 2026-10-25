@@ -12,13 +12,22 @@ Deutsche Version weiter unten.
 
 | | Rule | Level |
 |---|---|---|
-| 1 | Deauth/disassoc flood (more than 20/s total, or more than 5/s against your BSSID) | ALARM |
+| 1 | Deauth/disassoc flood (more than 20/s total, or more than 5/s against your BSSID, measured over at least 1 s and at least 8 frames) | ALARM |
+| 1b | Same, but every frame comes from your AP and the RSSI matches its beacons. Usually a client stuck in a reconnect loop, not an attack | WARN |
 | 2 | Evil twin: your SSID from a BSSID that is not whitelisted | ALARM |
+| 2b | Cloned BSSID: beacons with your BSSID whose TSF offset jumps around (two radios, two clocks), or whose IE set differs from the one learned at first boot | ALARM |
 | 3 | Your SSID or BSSID without an RSN IE (open network) | ALARM |
 | 4 | Your AP on a different channel than expected | WARN |
 | 5 | No beacon from your AP for 30 s | WARN |
+| 6 | Deauth with your BSSID as sender but an RSSI that is off by more than 10 dB from your AP's beacons. Somebody else sent that | ALARM |
 
 Thresholds are in `src/config.h`.
+
+Every deauth against your BSSID goes into an evidence log (sender, receiver, reason code, RSSI, channel). On ALARM the log is printed to serial and written to NVS, and printed again after the next boot. So a reset no longer eats the evidence.
+
+Rule 6 and the RSSI part of 1b assume the board sits close to the router, so your AP's own frames are clearly louder than anything from outside. On a desk next to the FritzBox you see about -25 dBm; a spoofed frame from the neighbour's flat arrives 20 dB weaker.
+
+Rule 2b learns the IE hash from the first beacon it sees and keeps it in NVS. After a router firmware update or a config change it will complain. Hold BOOT for 3 s to relearn. A single TSF jump is only a WARN (AP rebooted); three jumps within 10 s is an alarm.
 
 ## Flashing (no toolchain)
 
@@ -42,7 +51,9 @@ Mesh repeaters broadcasting the same SSID have to go into the whitelist too, or 
 
 ## How it works
 
-- Promiscuous RX, management frames only. The callback counts deauths and pushes matching beacons/probe responses into a ring buffer. Everything else happens in `loop()`.
+- Promiscuous RX, management frames only. The callback counts deauths, pushes matching beacons/probe responses into a ring buffer and deauths against your BSSID into a second one. Everything else happens in `loop()`.
+- TSF check: each beacon carries the AP's 64 bit microsecond clock, `rx_ctrl.timestamp` gives the board's own. Their difference drifts by a few ppm at most. A second transmitter using the same BSSID has a different clock, so the difference jumps back and forth.
+- IE hash: FNV-1a over the order and length of all IEs plus the content of the static ones. TIM, BSS Load, HT Operation and HE Operation are skipped (they change in normal operation), vendor IEs count only by OUI and type.
 - Channel hopping is park-and-sweep: 20 s on the home channel, then 13 x 150 ms across the rest. Deauth rates are computed per channel against airtime, not wall clock, otherwise hopping would dilute a flood by a factor of 13. The trade-off table is in `config.h`.
 - The sender's channel comes from the DS Parameter IE, not from `rx_ctrl.channel` (adjacent-channel bleed).
 - Display is 320x172 landscape via LovyanGFX, framebuffer as a sprite. Fonts are custom GFX fonts with Latin-1 (`tools/gen_gfxfont.py`), the bundled ones can't do umlauts.
@@ -51,6 +62,8 @@ Mesh repeaters broadcasting the same SSID have to go into the whitelist too, or 
 ## Things to know
 
 - One radio, one channel. Short deauth bursts on the home channel are caught with about 92 % probability; a twin on a foreign channel can take up to 22 s to show up. You only get both fully with two boards.
+- Everything here is passive. There is no "connect to the suspicious AP and check the WAN IP" test on purpose: joining a twin with your real PSK hands the attacker a handshake to crack offline, and a bridged twin shows your real WAN IP anyway. The TSF and IE checks give you a second factor without sending a byte.
+- The RSSI rule can be fooled by an attacker standing next to your router. That is a different problem.
 - WPA3/PMF makes deauth attacks useless, but they still show up. In WPA2+WPA3 mixed mode the WPA2 clients can still be kicked.
 - ntfy (`NTFY_ENABLE 1`): on ALARM it briefly joins the Wi-Fi, posts, and goes back to sniffing. Blind for 5 to 15 s. If the AP is under attack right then, the connect will fail, as you'd expect.
 - Partition table is `huge_app` (3 MB app, no OTA) so ntfy with TLS still fits.
@@ -73,13 +86,22 @@ Gebaut für eine FritzBox, läuft aber mit jedem AP. Nur SSID und BSSID eintrage
 
 | | Regel | Stufe |
 |---|---|---|
-| 1 | Deauth/Disassoc-Flut (mehr als 20/s gesamt oder mehr als 5/s gegen deine BSSID) | ALARM |
+| 1 | Deauth/Disassoc-Flut (mehr als 20/s gesamt oder mehr als 5/s gegen deine BSSID, gemessen über mindestens 1 s und mindestens 8 Frames) | ALARM |
+| 1b | Dasselbe, aber alle Frames kommen vom eigenen AP und der RSSI passt zu seinen Beacons. Meist ein Client in der Reconnect-Schleife, kein Angriff | WARN |
 | 2 | Evil Twin, deine SSID von einer fremden BSSID | ALARM |
+| 2b | Geklonte BSSID: Beacons mit deiner BSSID, deren TSF-Offset springt (zwei Radios, zwei Uhren) oder deren IE-Set vom beim ersten Boot gelernten abweicht | ALARM |
 | 3 | Deine SSID/BSSID ohne RSN-IE (offen) | ALARM |
 | 4 | Dein AP auf anderem Kanal als erwartet | WARN |
 | 5 | Kein Beacon vom eigenen AP seit 30 s | WARN |
+| 6 | Deauth mit deiner BSSID als Sender, aber RSSI mehr als 10 dB neben den Beacons deines APs. Das hat jemand anderes gesendet | ALARM |
 
 Schwellen in `src/config.h`.
+
+Jeder Deauth gegen die eigene BSSID landet in einem Beweis-Log (Sender, Empfänger, Reason-Code, RSSI, Kanal). Bei ALARM wird es seriell ausgegeben und in den NVS geschrieben, beim nächsten Boot noch einmal ausgegeben. Ein Reset frisst die Beweise damit nicht mehr.
+
+Regel 6 und der RSSI-Teil von 1b setzen voraus, dass das Board nah am Router steht, damit dessen eigene Frames deutlich lauter sind als alles von draußen. Neben der FritzBox sind das etwa -25 dBm, ein gespooftes Frame aus der Nachbarwohnung kommt 20 dB leiser an.
+
+Regel 2b lernt den IE-Hash vom ersten Beacon und merkt ihn sich im NVS. Nach einem Router-Update oder einer Konfigänderung meckert sie. BOOT 3 s halten, dann wird neu gelernt. Ein einzelner TSF-Sprung ist nur WARN (AP neu gestartet), drei Sprünge in 10 s sind Alarm.
 
 ## Flashen (ohne Toolchain)
 
@@ -103,7 +125,9 @@ Mesh-Repeater mit gleicher SSID müssen mit in die Whitelist, sonst Dauer-Twin-A
 
 ## Wie es intern läuft
 
-- Promiscuous-RX, nur Management-Frames. Der Callback zählt Deauths und schiebt passende Beacons/Probe-Responses in einen Ringpuffer. Der Rest passiert im `loop()`.
+- Promiscuous-RX, nur Management-Frames. Der Callback zählt Deauths, schiebt passende Beacons/Probe-Responses in einen Ringpuffer und Deauths gegen die eigene BSSID in einen zweiten. Der Rest passiert im `loop()`.
+- TSF-Prüfung: Jedes Beacon trägt die 64-bit-Mikrosekunden-Uhr des APs, `rx_ctrl.timestamp` liefert die des Boards. Die Differenz driftet um ein paar ppm, mehr nicht. Ein zweiter Sender mit derselben BSSID hat eine andere Uhr, dann springt die Differenz hin und her.
+- IE-Hash: FNV-1a über Reihenfolge und Länge aller IEs plus den Inhalt der statischen. TIM, BSS Load, HT Operation und HE Operation werden übersprungen (ändern sich im Betrieb), Vendor-IEs zählen nur mit OUI und Typ.
 - Kanal-Hopping als Park-und-Sweep: 20 s auf dem Heimkanal, dann 13 x 150 ms über alle anderen. Deauth-Raten werden pro Kanal auf Airtime bezogen, nicht auf die Wanduhr, sonst würde das Hopping eine Flut um Faktor 13 verdünnen. Trade-off-Tabelle in `config.h`.
 - Der Kanal des Senders kommt aus der DS-Parameter-IE, nicht aus `rx_ctrl.channel` (Nachbarkanal-Bleed).
 - Display 320x172 quer über LovyanGFX, Framebuffer als Sprite. Fonts sind eigene GFXfonts mit Latin-1 (`tools/gen_gfxfont.py`), die mitgelieferten können kein ä.
@@ -112,6 +136,8 @@ Mesh-Repeater mit gleicher SSID müssen mit in die Whitelist, sonst Dauer-Twin-A
 ## Was man wissen sollte
 
 - Ein Gerät, ein Kanal. Kurze Deauth-Bursts auf dem Heimkanal werden mit etwa 92 % gesehen, ein Twin auf einem Fremdkanal mit bis zu 22 s Verzögerung. Beides vollständig gibt es nur mit zwei Boards.
+- Alles hier ist passiv. Einen "mit dem verdächtigen AP verbinden und WAN-IP prüfen"-Test gibt es absichtlich nicht: Wer sich mit dem echten PSK bei einem Twin einbucht, schenkt dem Angreifer einen Handshake zum Offline-Cracken, und ein gebridgter Twin zeigt sowieso die echte WAN-IP. TSF und IE-Hash sind der zweite Faktor, ohne ein Byte zu senden.
+- Die RSSI-Regel lässt sich von einem Angreifer direkt neben dem Router austricksen. Das ist dann ein anderes Problem.
 - WPA3/PMF macht Deauth-Angriffe wirkungslos, sichtbar sind sie trotzdem. Bei WPA2+WPA3-Mischbetrieb sind die WPA2-Clients weiterhin kickbar.
 - ntfy (`NTFY_ENABLE 1`): bucht sich bei ALARM kurz ins WLAN ein, postet, geht zurück in den Sniff-Modus. 5 bis 15 s blind. Läuft der AP gerade unter Beschuss, scheitert das erwartbar.
 - Partitionstabelle `huge_app` (3 MB App, kein OTA), damit ntfy mit TLS noch reinpasst.

@@ -9,7 +9,52 @@
 #include <esp_wifi.h>
 #include <esp_wifi_types.h>
 #include <LovyanGFX.hpp>
+#include <Preferences.h>
 #include "config.h"
+
+// Defaults für ältere private config.h ohne die neuen Schalter
+#ifndef DEAUTH_MIN_WINDOW_MS
+#define DEAUTH_MIN_WINDOW_MS 1000
+#endif
+#ifndef DEAUTH_MINE_MIN_FRAMES
+#define DEAUTH_MINE_MIN_FRAMES 8
+#endif
+#ifndef DEAUTH_TOTAL_MIN_FRAMES
+#define DEAUTH_TOTAL_MIN_FRAMES 20
+#endif
+#ifndef RSSI_SPOOF_DELTA_DB
+#define RSSI_SPOOF_DELTA_DB 10
+#endif
+#ifndef DEAUTH_SPOOF_MIN_FRAMES
+#define DEAUTH_SPOOF_MIN_FRAMES 3
+#endif
+#ifndef DEAUTH_FROM_AP_IS_WARN
+#define DEAUTH_FROM_AP_IS_WARN 1
+#endif
+#ifndef CHECK_TSF
+#define CHECK_TSF 1
+#endif
+#ifndef TSF_JUMP_US
+#define TSF_JUMP_US 3000
+#endif
+#ifndef TSF_JUMPS_FOR_ALARM
+#define TSF_JUMPS_FOR_ALARM 3
+#endif
+#ifndef TSF_JUMP_WINDOW_MS
+#define TSF_JUMP_WINDOW_MS 10000
+#endif
+#ifndef CHECK_IE_HASH
+#define CHECK_IE_HASH 1
+#endif
+#ifndef EVIDENCE_SIZE
+#define EVIDENCE_SIZE 16
+#endif
+#ifndef EVIDENCE_NVS
+#define EVIDENCE_NVS 1
+#endif
+#ifndef BUTTON_LONG_MS
+#define BUTTON_LONG_MS 3000
+#endif
 #include "font_dejavu_13.h"   // Latin-1 (Umlaute), generiert mit tools/gen_gfxfont.py
 #include "font_dejavu_19.h"
 #include "font_dejavu_b30.h"
@@ -84,12 +129,25 @@ static bool        fbOk = false;
 enum : uint8_t { EV_SSID_MATCH = 1, EV_WHITELISTED = 2, EV_HAS_RSN = 4, EV_HAS_WPA1 = 8 };
 
 struct ApEvent {
-    uint8_t bssid[6];
-    uint8_t subtype;     // 8 = Beacon, 5 = Probe Response
-    uint8_t rxChannel;   // rx_ctrl.channel (kann Nachbarkanal-Bleed sein)
-    uint8_t dsChannel;   // DS Parameter Set IE, 0 = fehlt
-    uint8_t flags;
-    int8_t  rssi;
+    uint8_t  bssid[6];
+    uint8_t  subtype;     // 8 = Beacon, 5 = Probe Response
+    uint8_t  rxChannel;   // rx_ctrl.channel (kann Nachbarkanal-Bleed sein)
+    uint8_t  dsChannel;   // DS Parameter Set IE, 0 = fehlt
+    uint8_t  flags;
+    int8_t   rssi;
+    uint32_t tsfLo;       // Beacon-Timestamp (TSF des Senders), untere 32 Bit
+    uint32_t rxTs;        // rx_ctrl.timestamp: lokaler TSF beim Empfang, µs
+    uint32_t ieHash;      // FNV-1a über IE-Struktur, ohne volatile Inhalte (TIM, BSS Load, HT/HE Operation)
+};
+
+// Deauth/Disassoc gegen eigene BSSID, als Beweismittel. Zähler reichen nicht,
+// wer gesendet hat entscheidet alles.
+struct DeauthEvent {
+    uint8_t  a1[6], a2[6];   // DA, SA
+    uint16_t reason;
+    int8_t   rssi;
+    uint8_t  ch;
+    uint8_t  subtype;        // 0x0C Deauth, 0x0A Disassoc
 };
 
 static constexpr uint8_t RING_SIZE = 32;   // Zweierpotenz
@@ -97,6 +155,12 @@ static ApEvent               ring[RING_SIZE];
 static volatile uint8_t      ringHead = 0;  // Producer (WiFi-Task)
 static volatile uint8_t      ringTail = 0;  // Consumer (loop)
 static std::atomic<uint32_t> ringDrops{0};
+
+static constexpr uint8_t DRING_SIZE = 16;  // Zweierpotenz
+static DeauthEvent           dring[DRING_SIZE];
+static volatile uint8_t      dringHead = 0;
+static volatile uint8_t      dringTail = 0;
+static std::atomic<uint32_t> dringDrops{0};
 
 static std::atomic<uint32_t> cntDeauthTotal{0};
 static std::atomic<uint32_t> cntDeauthMine{0};
@@ -108,6 +172,11 @@ static int whitelistIndex(const uint8_t* mac) {
     for (size_t i = 0; i < WHITELIST_COUNT; i++)
         if (memcmp(WHITELIST[i].bssid, mac, 6) == 0) return (int)i;
     return -1;
+}
+
+static inline uint32_t fnv1a(uint32_t h, const uint8_t* d, size_t n) {
+    for (size_t i = 0; i < n; i++) { h ^= d[i]; h *= 16777619u; }
+    return h;
 }
 
 // Läuft im WiFi-Task (kein ISR), Payload nur während des Callbacks gültig.
@@ -129,8 +198,20 @@ static void promiscCb(void* buf, wifi_promiscuous_pkt_type_t type) {
 
     if (subtype == 0x0C || subtype == 0x0A) {     // Deauth / Disassoc
         cntDeauthTotal.fetch_add(1, std::memory_order_relaxed);
-        if (whitelistIndex(a1) >= 0 || whitelistIndex(a2) >= 0 || whitelistIndex(a3) >= 0)
+        if (whitelistIndex(a1) >= 0 || whitelistIndex(a2) >= 0 || whitelistIndex(a3) >= 0) {
             cntDeauthMine.fetch_add(1, std::memory_order_relaxed);
+            const uint8_t head = dringHead;
+            const uint8_t next = (head + 1) & (DRING_SIZE - 1);
+            if (next == dringTail) { dringDrops.fetch_add(1, std::memory_order_relaxed); return; }
+            DeauthEvent& d = dring[head];
+            memcpy(d.a1, a1, 6);
+            memcpy(d.a2, a2, 6);
+            d.reason  = (len >= 26) ? (uint16_t)(p[24] | (p[25] << 8)) : 0;
+            d.rssi    = pkt->rx_ctrl.rssi;
+            d.ch      = pkt->rx_ctrl.channel;
+            d.subtype = subtype;
+            dringHead = next;
+        }
         return;
     }
     if (subtype != 0x08 && subtype != 0x05) return;   // nur Beacon / Probe Resp
@@ -142,6 +223,7 @@ static void promiscCb(void* buf, wifi_promiscuous_pkt_type_t type) {
     const uint8_t* ie = body + 12;
     int rem = blen - 12;
     uint8_t flags = 0, ds = 0;
+    uint32_t h = fnv1a(2166136261u, body + 8, 4);   // Beacon-Intervall + Capability
     while (rem >= 2) {
         const uint8_t id = ie[0], l = ie[1];
         if (l + 2 > rem) break;
@@ -161,6 +243,17 @@ static void promiscCb(void* buf, wifi_promiscuous_pkt_type_t type) {
                 break;
             default: break;
         }
+        // IE-Fingerprint: Reihenfolge und Längen immer, Inhalt nur wo er statisch ist.
+        h = fnv1a(h, ie, 2);
+        if (id == 5 || id == 11 || id == 61) {
+            // TIM, BSS Load, HT Operation: ändern sich im Betrieb
+        } else if (id == 221) {
+            h = fnv1a(h, ie + 2, l < 4 ? l : 4);           // nur OUI + Typ
+        } else if (id == 255 && l >= 1 && ie[2] == 36) {
+            // HE Operation: BSS Color kann wechseln
+        } else {
+            h = fnv1a(h, ie + 2, l);
+        }
         ie  += 2 + l;
         rem -= 2 + l;
     }
@@ -177,6 +270,9 @@ static void promiscCb(void* buf, wifi_promiscuous_pkt_type_t type) {
     e.dsChannel = ds;
     e.flags     = flags;
     e.rssi      = pkt->rx_ctrl.rssi;
+    e.tsfLo     = (uint32_t)body[0] | ((uint32_t)body[1] << 8) | ((uint32_t)body[2] << 16) | ((uint32_t)body[3] << 24);
+    e.rxTs      = pkt->rx_ctrl.timestamp;
+    e.ieHash    = h;
     ringHead    = next;
 }
 
@@ -216,9 +312,105 @@ static uint8_t  twinCh = 0;
 
 static uint32_t lastNtfyMs = 0;
 static bool     ntfyPending = false;
+static uint32_t alarmCount = 0;
+
+static Preferences prefs;
+
+// Fingerprint je Whitelist-Eintrag (Regel 2b, Regel 6)
+struct Fingerprint {
+    uint32_t ieHash    = 0;      // 0 = noch nicht gelernt
+    uint8_t  ieMiss    = 0;      // Abweichungen in Folge
+    bool     tsfValid  = false;
+    uint32_t tsfOffset = 0;      // tsfLo - rxTs, muss bis auf Drift konstant sein
+    uint8_t  jumps     = 0;
+    uint32_t jumpWin   = 0;
+    bool     rssiValid = false;
+    int16_t  rssiEma4  = 0;      // Beacon-RSSI, EMA, Faktor 4
+};
+static Fingerprint fp[WHITELIST_COUNT > 0 ? WHITELIST_COUNT : 1];
+
+// Beweis-Log: letzte Deauths gegen eigene BSSID, chronologisch
+enum : uint8_t { CLS_FROM_AP = 0, CLS_SPOOFED = 1, CLS_OTHER = 2 };
+struct __attribute__((packed)) Evidence {
+    uint32_t ms;
+    uint8_t  sa[6], da[6];
+    uint16_t reason;
+    int8_t   rssi;
+    uint8_t  ch;
+    uint8_t  cls;        // Bit 0..1 Klasse, Bit 7 = Disassoc
+};
+static Evidence evLog[EVIDENCE_SIZE];
+static uint8_t  evHead = 0, evCount = 0;
+static bool     evDirty = false;
+static uint32_t lastEvDump = 0;
+// Klassen-Zähler im laufenden Deauth-Fenster
+static uint32_t winFromAp = 0, winSpoof = 0, winOther = 0;
+static int8_t   lastSpoofRssi = 0, lastSpoofApRssi = 0;
+static uint16_t lastReason = 0;
 
 static void macToStr(const uint8_t* m, char* out) {
     snprintf(out, 18, "%02X:%02X:%02X:%02X:%02X:%02X", m[0], m[1], m[2], m[3], m[4], m[5]);
+}
+
+static const char* clsName(uint8_t cls) {
+    switch (cls & 3) {
+        case CLS_FROM_AP: return "AP";
+        case CLS_SPOOFED: return "SPOOF";
+        default:          return "fremd";
+    }
+}
+
+static void dumpEvidence(const char* head) {
+    char sa[18], da[18];
+    Serial.printf("%s (%u Einträge, drop %lu):\n", head, evCount, (unsigned long)dringDrops.load());
+    for (uint8_t i = 0; i < evCount; i++) {
+        const Evidence& e = evLog[(evHead + EVIDENCE_SIZE - evCount + i) % EVIDENCE_SIZE];
+        macToStr(e.sa, sa); macToStr(e.da, da);
+        Serial.printf("  [%lu] %s ch%u SA=%s DA=%s reason=%u %ddBm %s\n", (unsigned long)e.ms,
+                      (e.cls & 0x80) ? "Disassoc" : "Deauth", e.ch, sa, da, e.reason, e.rssi, clsName(e.cls));
+    }
+}
+
+#if EVIDENCE_NVS
+static void saveEvidence(const char* reason, const char* detail) {
+    if (!evDirty) return;
+    prefs.putBytes("ev", evLog, sizeof evLog);
+    prefs.putUChar("evh", evHead);
+    prefs.putUChar("evn", evCount);
+    prefs.putString("evr", reason);
+    prefs.putString("evd", detail);
+    prefs.putUInt("evu", millis() / 1000);
+    evDirty = false;
+}
+
+static void printSavedEvidence() {
+    if (!prefs.isKey("evr")) return;
+    Serial.printf("Letzter Alarm vor Reset: %s | %s (Uptime damals %lu s)\n",
+                  prefs.getString("evr").c_str(), prefs.getString("evd").c_str(),
+                  (unsigned long)prefs.getUInt("evu"));
+    if (prefs.getBytesLength("ev") == sizeof evLog) {
+        prefs.getBytes("ev", evLog, sizeof evLog);
+        evHead  = prefs.getUChar("evh");
+        evCount = prefs.getUChar("evn");
+        dumpEvidence("Beweis-Log davon");
+        evHead = evCount = 0;           // RAM-Log frisch starten
+        memset(evLog, 0, sizeof evLog);
+    }
+}
+#endif
+
+static void pushEvidence(const DeauthEvent& d, uint8_t cls) {
+    Evidence& e = evLog[evHead];
+    e.ms = millis();
+    memcpy(e.sa, d.a2, 6);
+    memcpy(e.da, d.a1, 6);
+    e.reason = d.reason;
+    e.rssi   = d.rssi;
+    e.ch     = d.ch;
+    e.cls    = cls | (d.subtype == 0x0A ? 0x80 : 0);
+    evHead = (evHead + 1) % EVIDENCE_SIZE;
+    if (evCount < EVIDENCE_SIZE) evCount++;
+    evDirty = true;
 }
 
 // Heimkanal = erwarteter Kanal einer Whitelist-BSSID oder zuletzt gesehener
@@ -231,15 +423,30 @@ static bool isHomeChannel(uint8_t ch) {
     return lastOwnBeaconCh == ch;
 }
 
+// Beweis-Log seriell ausgeben und sichern, höchstens alle 10 s (Twin-Alarm
+// feuert pro Beacon, NVS soll nicht pro Beacon beschrieben werden).
+static void secureEvidence(const char* reason, const char* detail) {
+    const uint32_t now = millis();
+    if (lastEvDump && now - lastEvDump < 10000) return;
+    lastEvDump = now;
+    if (evCount) dumpEvidence("Beweis-Log");
+#if EVIDENCE_NVS
+    saveEvidence(reason, detail);
+#endif
+}
+
 static void raiseAlarm(const char* reason, const char* detail) {
     const uint32_t now = millis();
     const bool fresh = !alarmLatched;
+    const bool changed = fresh || strcmp(alarmReason, reason) != 0;
     alarmLatched = true;
     alarmLastCond = now;
     if (fresh) alarmSince = now;
+    if (changed) alarmCount++;
     strlcpy(alarmReason, reason, sizeof alarmReason);
     strlcpy(alarmDetail, detail, sizeof alarmDetail);
-    Serial.printf("[%lu] ALARM %s | %s\n", (unsigned long)now, reason, detail);
+    if (changed) Serial.printf("[%lu] ALARM #%lu %s | %s\n", (unsigned long)now, (unsigned long)alarmCount, reason, detail);
+    secureEvidence(reason, detail);
 #if NTFY_ENABLE
     if (fresh) ntfyPending = true;
 #endif
@@ -255,8 +462,11 @@ static void raiseWarn(const char* reason, const char* detail) {
 }
 
 static void evaluateDeauth(uint8_t ch, ChanStat& cs) {
+    // Kein Early-Trigger mehr unter DEAUTH_MIN_WINDOW_MS: 5 Frames in 330 ms
+    // sind "15/s", aber eben nur 5 Frames. Rate und absolute Anzahl müssen passen.
     const bool windowFull = cs.airtimeMs >= RATE_WINDOW_MS;
-    const bool early = cs.total >= DEAUTH_TOTAL_PER_S || cs.mine >= DEAUTH_MINE_PER_S;
+    const bool early = cs.airtimeMs >= DEAUTH_MIN_WINDOW_MS &&
+                       (cs.total >= DEAUTH_TOTAL_MIN_FRAMES || cs.mine >= DEAUTH_MINE_MIN_FRAMES);
     if (!windowFull && !early) return;
     if (cs.airtimeMs == 0) return;
 
@@ -270,14 +480,113 @@ static void evaluateDeauth(uint8_t ch, ChanStat& cs) {
     }
 
     char d[40];
-    if (cs.lastRateMine > DEAUTH_MINE_PER_S) {
-        snprintf(d, sizeof d, "%.0f/s eig. BSSID ch%u", cs.lastRateMine, ch);
-        raiseAlarm("DEAUTH eig. BSSID", d);
-    } else if (cs.lastRateTotal > DEAUTH_TOTAL_PER_S) {
+    if (cs.lastRateMine > DEAUTH_MINE_PER_S && cs.mine >= DEAUTH_MINE_MIN_FRAMES) {
+        // Wer hat gesendet? Alles vom AP mit passendem RSSI ist ein Client in
+        // der Reconnect-Schleife oder Band-Steering, kein Angriff.
+        bool anyRssi = false;
+        for (size_t i = 0; i < WHITELIST_COUNT; i++) if (fp[i].rssiValid) anyRssi = true;
+        const bool onlyAp = anyRssi && winSpoof == 0 && winOther == 0 && winFromAp > 0;
+        snprintf(d, sizeof d, "%.0f/s ch%u AP%lu sp%lu fr%lu r%u", cs.lastRateMine, ch,
+                 (unsigned long)winFromAp, (unsigned long)winSpoof, (unsigned long)winOther, lastReason);
+        if (onlyAp && DEAUTH_FROM_AP_IS_WARN) raiseWarn("DEAUTH vom AP", d);
+        else                                   raiseAlarm("DEAUTH eig. BSSID", d);
+    } else if (cs.lastRateTotal > DEAUTH_TOTAL_PER_S && cs.total >= DEAUTH_TOTAL_MIN_FRAMES) {
         snprintf(d, sizeof d, "%.0f/s gesamt ch%u", cs.lastRateTotal, ch);
         raiseAlarm("DEAUTH-Flut", d);
     }
     cs.total = cs.mine = cs.airtimeMs = 0;
+    winFromAp = winSpoof = winOther = 0;
+}
+
+// Deauth-Ring auswerten: klassifizieren, ins Beweis-Log, Regel 6.
+static void processDeauths() {
+    static uint32_t logWin = 0; static uint8_t logN = 0;
+    char sa[18], da[18], d[40];
+    while (dringTail != dringHead) {
+        const DeauthEvent e = dring[dringTail];
+        dringTail = (dringTail + 1) & (DRING_SIZE - 1);
+        lastReason = e.reason;
+
+        uint8_t cls = CLS_OTHER;
+        const int idx = whitelistIndex(e.a2);          // SA = eigene BSSID?
+        if (idx >= 0) {
+            const Fingerprint& f = fp[idx];
+            if (f.rssiValid) {
+                const int apRssi = f.rssiEma4 / 4;
+                const int delta  = e.rssi - apRssi;
+                if (delta > RSSI_SPOOF_DELTA_DB || delta < -RSSI_SPOOF_DELTA_DB) {
+                    cls = CLS_SPOOFED;
+                    lastSpoofRssi = e.rssi; lastSpoofApRssi = (int8_t)apRssi;
+                } else cls = CLS_FROM_AP;
+            } else cls = CLS_FROM_AP;                   // noch kein Beacon-RSSI, nicht bewertbar
+        }
+        if (cls == CLS_FROM_AP) winFromAp++; else if (cls == CLS_SPOOFED) winSpoof++; else winOther++;
+        pushEvidence(e, cls);
+
+        // Serial, höchstens 10 Zeilen pro Sekunde
+        const uint32_t now = millis();
+        if (now - logWin > 1000) { logWin = now; logN = 0; }
+        if (logN < 10) {
+            logN++;
+            macToStr(e.a2, sa); macToStr(e.a1, da);
+            Serial.printf("[%lu] %s ch%u SA=%s DA=%s reason=%u %ddBm %s\n", (unsigned long)now,
+                          e.subtype == 0x0A ? "Disassoc" : "Deauth", e.ch, sa, da, e.reason, e.rssi, clsName(cls));
+        }
+        // Regel 6: Frames mit SA = AP, aber RSSI passt nicht zu den Beacons
+        if (winSpoof >= DEAUTH_SPOOF_MIN_FRAMES) {
+            snprintf(d, sizeof d, "%lu Fr. %ddBm, AP %ddBm", (unsigned long)winSpoof, lastSpoofRssi, lastSpoofApRssi);
+            raiseAlarm("DEAUTH gespooft", d);
+        }
+    }
+}
+
+// Regel 2b: geklonte BSSID. Beacon-RSSI mitführen (Regel 6), IE-Hash gegen
+// gelernten Wert, TSF-Offset auf Sprünge prüfen.
+static void checkFingerprint(int idx, const ApEvent& e) {
+    Fingerprint& f = fp[idx];
+    const char* label = WHITELIST[idx].label;
+    char d[40];
+
+    if (!f.rssiValid) { f.rssiEma4 = e.rssi * 4; f.rssiValid = true; }
+    else               f.rssiEma4 += (e.rssi * 4 - f.rssiEma4) / 8;
+
+#if CHECK_IE_HASH
+    if (f.ieHash == 0) {
+        f.ieHash = e.ieHash;
+        char key[8]; snprintf(key, sizeof key, "ie%d", idx);
+        prefs.putUInt(key, f.ieHash);
+        Serial.printf("IE-Hash %s gelernt: %08lX (BOOT 3 s halten zum Neulernen)\n", label, (unsigned long)f.ieHash);
+    } else if (e.ieHash != f.ieHash) {
+        // zwei in Folge, damit ein einzelner kaputter Beacon nicht reicht
+        if (++f.ieMiss >= 2) {
+            snprintf(d, sizeof d, "%s IE %08lX statt %08lX", label, (unsigned long)e.ieHash, (unsigned long)f.ieHash);
+            raiseAlarm("BSSID GEKLONT (IE)", d);
+        }
+    } else f.ieMiss = 0;
+#endif
+
+#if CHECK_TSF
+    const uint32_t off = e.tsfLo - e.rxTs;
+    if (f.tsfValid) {
+        const int32_t dev = (int32_t)(off - f.tsfOffset);
+        if (dev > TSF_JUMP_US || dev < -TSF_JUMP_US) {
+            const uint32_t now = millis();
+            if (now - f.jumpWin > TSF_JUMP_WINDOW_MS) { f.jumpWin = now; f.jumps = 0; }
+            f.jumps++;
+            Serial.printf("[%lu] TSF-Sprung %s %+ld us (%u in %lus)\n", (unsigned long)now, label,
+                          (long)dev, f.jumps, (unsigned long)(TSF_JUMP_WINDOW_MS / 1000));
+            if (f.jumps >= TSF_JUMPS_FOR_ALARM) {
+                snprintf(d, sizeof d, "%s %u TSF-Sprünge in %lus", label, f.jumps, (unsigned long)(TSF_JUMP_WINDOW_MS / 1000));
+                raiseAlarm("BSSID GEKLONT (TSF)", d);
+            } else {
+                snprintf(d, sizeof d, "%s %+ld us (AP-Neustart?)", label, (long)dev);
+                raiseWarn("TSF-Sprung", d);
+            }
+        }
+    }
+    f.tsfOffset = off;
+    f.tsfValid  = true;
+#endif
 }
 
 static void processEvents() {
@@ -317,14 +626,15 @@ static void processEvents() {
             raiseAlarm(wl ? "BSSID ohne RSN" : "SSID offen", d);
         }
         if (wl) {
+            const int idx = whitelistIndex(e.bssid);
             if (e.subtype == 8) {
                 lastOwnBeaconMs = millis();
                 ownBeaconSeen   = true;
                 lastOwnBeaconCh = effCh;
+                if (idx >= 0) checkFingerprint(idx, e);
             }
             // Regel 4: Kanalabweichung
 #if CHECK_CHANNEL
-            const int idx = whitelistIndex(e.bssid);
             if (idx >= 0 && WHITELIST[idx].expectedChannel != 0 &&
                 e.dsChannel != 0 && e.dsChannel != WHITELIST[idx].expectedChannel) {
                 snprintf(d, sizeof d, "%s ch%u statt %u", WHITELIST[idx].label, e.dsChannel,
@@ -411,22 +721,40 @@ static Level currentLevel() {
 // ---------------------------------------------------------------------
 // Taster
 // ---------------------------------------------------------------------
+// Gelernte Fingerprints verwerfen (nach Router-Update oder Konfigänderung)
+static void relearnFingerprints() {
+    for (size_t i = 0; i < WHITELIST_COUNT; i++) {
+        fp[i] = Fingerprint();
+        char key[8]; snprintf(key, sizeof key, "ie%u", (unsigned)i);
+        prefs.remove(key);
+    }
+    Serial.println("Fingerprints gelöscht, lerne neu");
+    raiseWarn("FINGERPRINT NEU", "IE-Hash und TSF werden neu gelernt");
+}
+
 static void pollButton() {
     static bool     stable = true, lastRaw = true;
-    static uint32_t lastChange = 0;
+    static uint32_t lastChange = 0, pressedAt = 0;
+    static bool     longDone = false;
     const bool raw = digitalRead(PIN_BUTTON);
     const uint32_t now = millis();
     if (raw != lastRaw) { lastRaw = raw; lastChange = now; }
     if (now - lastChange > BUTTON_DEBOUNCE_MS && raw != stable) {
         stable = raw;
         if (!stable) {                       // Flanke: gedrückt
+            pressedAt = now; longDone = false;
             if (alarmLatched) Serial.println("ALARM quittiert");
             alarmLatched = false;
             warnLast = 0;
             dispDeauthRate = dispDeauthMine = 0;
             dispDeauthCh = 0;
             strlcpy(twinBssid, "-", sizeof twinBssid);
+            twinCh = 0;
         }
+    }
+    if (!stable && !longDone && now - pressedAt >= BUTTON_LONG_MS) {   // lang gehalten
+        longDone = true;
+        relearnFingerprints();
     }
 }
 
@@ -515,7 +843,8 @@ static void draw(Level lvl, bool blinkOn) {
     char up[24]; fmtUptime(up, sizeof up);
     snprintf(line, sizeof line, "%s%s", ntfyPending ? "ntfy  " : "", up);
     g.drawString(line, W - 6, 6);
-    snprintf(line, sizeof line, "drop %lu", (unsigned long)ringDrops.load());
+    if (alarmCount) snprintf(line, sizeof line, "drop %lu  #%lu", (unsigned long)ringDrops.load(), (unsigned long)alarmCount);
+    else            snprintf(line, sizeof line, "drop %lu", (unsigned long)ringDrops.load());
     g.drawString(line, W - 6, 24);
 
     // Grund (Font4, 26 px) + Detail (Font2)
@@ -639,6 +968,18 @@ void setup() {
     lcd.setFont(&DejaVuL1_13);
     lcd.drawString("WLAN-IDS startet …", 4, 4);
 
+    prefs.begin("ids", false);
+#if CHECK_IE_HASH
+    for (size_t i = 0; i < WHITELIST_COUNT; i++) {
+        char key[8]; snprintf(key, sizeof key, "ie%u", (unsigned)i);
+        fp[i].ieHash = prefs.getUInt(key, 0);
+        if (fp[i].ieHash) Serial.printf("IE-Hash %s aus NVS: %08lX\n", WHITELIST[i].label, (unsigned long)fp[i].ieHash);
+    }
+#endif
+#if EVIDENCE_NVS
+    printSavedEvidence();
+#endif
+
     WiFi.persistent(false);
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);
@@ -662,6 +1003,7 @@ void loop() {
     static bool blink = false;
     static uint32_t lastBlink = 0;
 
+    processDeauths();          // vor der Bewertung, damit die Klassen-Zähler stimmen
     hopChannel();
     processEvents();
     checkBeaconTimeout();
