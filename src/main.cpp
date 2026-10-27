@@ -55,6 +55,7 @@
 #ifndef BUTTON_LONG_MS
 #define BUTTON_LONG_MS 3000
 #endif
+#define IE_HASH_VERSION 2   // hochzählen, wenn sich ändert, was in den Hash eingeht
 #include "font_dejavu_13.h"   // Latin-1 (Umlaute), generiert mit tools/gen_gfxfont.py
 #include "font_dejavu_19.h"
 #include "font_dejavu_b30.h"
@@ -137,7 +138,7 @@ struct ApEvent {
     int8_t   rssi;
     uint32_t tsfLo;       // Beacon-Timestamp (TSF des Senders), untere 32 Bit
     uint32_t rxTs;        // rx_ctrl.timestamp: lokaler TSF beim Empfang, µs
-    uint32_t ieHash;      // FNV-1a über IE-Struktur, ohne volatile Inhalte (TIM, BSS Load, HT/HE Operation)
+    uint32_t ieHash;      // FNV-1a über Identitäts-IEs (Whitelist, siehe promiscCb)
 };
 
 // Deauth/Disassoc gegen eigene BSSID, als Beweismittel. Zähler reichen nicht,
@@ -165,6 +166,13 @@ static std::atomic<uint32_t> dringDrops{0};
 static std::atomic<uint32_t> cntDeauthTotal{0};
 static std::atomic<uint32_t> cntDeauthMine{0};
 static std::atomic<uint32_t> cntMgmtTotal{0};
+
+// Debug: nach IE-Alarm einmal die IE-Liste des nächsten eigenen Beacons
+// sichern (id, len, bei Vendor OUI+Typ), damit man sieht, was sich ändert.
+static volatile bool ieDumpWanted = false;
+static volatile bool ieDumpReady  = false;
+static uint8_t       ieDump[160];
+static uint8_t       ieDumpLen = 0;
 
 static size_t targetSsidLen = 0;
 
@@ -223,7 +231,7 @@ static void promiscCb(void* buf, wifi_promiscuous_pkt_type_t type) {
     const uint8_t* ie = body + 12;
     int rem = blen - 12;
     uint8_t flags = 0, ds = 0;
-    uint32_t h = fnv1a(2166136261u, body + 8, 4);   // Beacon-Intervall + Capability
+    uint32_t h = fnv1a(2166136261u, body + 8, 2);   // Beacon-Intervall. Capability nicht: Short-Slot-Bit kippt mit Legacy-Clients
     while (rem >= 2) {
         const uint8_t id = ie[0], l = ie[1];
         if (l + 2 > rem) break;
@@ -243,22 +251,53 @@ static void promiscCb(void* buf, wifi_promiscuous_pkt_type_t type) {
                 break;
             default: break;
         }
-        // IE-Fingerprint: Reihenfolge und Längen immer, Inhalt nur wo er statisch ist.
-        h = fnv1a(h, ie, 2);
-        if (id == 5 || id == 11 || id == 61) {
-            // TIM, BSS Load, HT Operation: ändern sich im Betrieb
-        } else if (id == 221) {
-            h = fnv1a(h, ie + 2, l < 4 ? l : 4);           // nur OUI + Typ
-        } else if (id == 255 && l >= 1 && ie[2] == 36) {
-            // HE Operation: BSS Color kann wechseln
-        } else {
-            h = fnv1a(h, ie + 2, l);
+        // IE-Fingerprint, Whitelist: nur IEs, die die Identität des APs
+        // beschreiben und sich im Betrieb nicht ändern. Alles andere (TIM,
+        // ERP-Protection, BSS Load, HT/HE Operation, CSA, BSS Color) kippt
+        // mit Clients oder Nachbarn und bleibt draußen.
+        switch (id) {
+            case 0:   // SSID
+            case 1:   // Supported Rates
+            case 3:   // DS Parameter
+            case 7:   // Country
+            case 45:  // HT Capabilities
+            case 48:  // RSN
+            case 50:  // Extended Supported Rates
+            case 127: // Extended Capabilities
+                h = fnv1a(h, ie, 2 + l);
+                break;
+            case 221: // Vendor: nur OUI + Typ, Länge/Inhalt nicht (WPS, AVM-IEs variieren)
+                h = fnv1a(h, ie, 1);
+                h = fnv1a(h, ie + 2, l < 4 ? l : 4);
+                break;
+            case 255: // Extension: nur HE Capabilities (35)
+                if (l >= 1 && ie[2] == 35) h = fnv1a(h, ie, 2 + l);
+                break;
+            default: break;
         }
         ie  += 2 + l;
         rem -= 2 + l;
     }
     if (whitelistIndex(a3) >= 0) flags |= EV_WHITELISTED;
     if (!(flags & (EV_SSID_MATCH | EV_WHITELISTED))) return;   // fremde Netze ignorieren
+
+    if (ieDumpWanted && !ieDumpReady && subtype == 0x08 && (flags & EV_WHITELISTED)) {
+        uint8_t n = 0;
+        const uint8_t* q = body + 12; int r = blen - 12;
+        while (r >= 2 && n + 6 <= sizeof ieDump) {
+            const uint8_t id = q[0], l = q[1];
+            if (l + 2 > r) break;
+            ieDump[n++] = id; ieDump[n++] = l;
+            if (id == 221 || id == 255) {                 // OUI+Typ bzw. Ext-ID
+                const uint8_t k = (id == 221) ? 4 : 1;
+                for (uint8_t i = 0; i < k; i++) ieDump[n++] = (i < l) ? q[2 + i] : 0;
+            }
+            q += 2 + l; r -= 2 + l;
+        }
+        ieDumpLen = n;
+        ieDumpWanted = false;
+        ieDumpReady  = true;
+    }
 
     const uint8_t head = ringHead;
     const uint8_t next = (head + 1) & (RING_SIZE - 1);
@@ -558,9 +597,11 @@ static void checkFingerprint(int idx, const ApEvent& e) {
         Serial.printf("IE-Hash %s gelernt: %08lX (BOOT 3 s halten zum Neulernen)\n", label, (unsigned long)f.ieHash);
     } else if (e.ieHash != f.ieHash) {
         // zwei in Folge, damit ein einzelner kaputter Beacon nicht reicht
-        if (++f.ieMiss >= 2) {
-            snprintf(d, sizeof d, "%s IE %08lX statt %08lX", label, (unsigned long)e.ieHash, (unsigned long)f.ieHash);
+        if (f.ieMiss < 255) f.ieMiss++;
+        if (f.ieMiss == 2) {
+            snprintf(d, sizeof d, "%s %08lX/%08lX", label, (unsigned long)e.ieHash, (unsigned long)f.ieHash);
             raiseAlarm("BSSID GEKLONT (IE)", d);
+            ieDumpWanted = true;      // nächsten Beacon dieser BSSID seriell zerlegen
         }
     } else f.ieMiss = 0;
 #endif
@@ -970,6 +1011,14 @@ void setup() {
 
     prefs.begin("ids", false);
 #if CHECK_IE_HASH
+    // Hash-Algorithmus geändert -> alte Werte wegwerfen, sonst Alarm beim ersten Beacon
+    if (prefs.getUChar("iev", 0) != IE_HASH_VERSION) {
+        for (size_t i = 0; i < WHITELIST_COUNT; i++) {
+            char key[8]; snprintf(key, sizeof key, "ie%u", (unsigned)i);
+            prefs.remove(key);
+        }
+        prefs.putUChar("iev", IE_HASH_VERSION);
+    }
     for (size_t i = 0; i < WHITELIST_COUNT; i++) {
         char key[8]; snprintf(key, sizeof key, "ie%u", (unsigned)i);
         fp[i].ieHash = prefs.getUInt(key, 0);
@@ -1007,6 +1056,22 @@ void loop() {
     hopChannel();
     processEvents();
     checkBeaconTimeout();
+    if (ieDumpReady) {
+        Serial.print("IE-Liste (id:len):");
+        for (uint8_t i = 0; i + 1 < ieDumpLen;) {
+            const uint8_t id = ieDump[i], l = ieDump[i + 1];
+            i += 2;
+            if (id == 221 && i + 4 <= ieDumpLen) {
+                Serial.printf(" 221:%u[%02X%02X%02X:%u]", l, ieDump[i], ieDump[i + 1], ieDump[i + 2], ieDump[i + 3]);
+                i += 4;
+            } else if (id == 255 && i + 1 <= ieDumpLen) {
+                Serial.printf(" 255.%u:%u", ieDump[i], l);
+                i += 1;
+            } else Serial.printf(" %u:%u", id, l);
+        }
+        Serial.println();
+        ieDumpReady = false;
+    }
     pollButton();
 
     const uint32_t now = millis();

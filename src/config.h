@@ -100,6 +100,7 @@ static const ApEntry WHITELIST[] = {
 #define ALARM_REQUIRE_ACK    1      // 1: bleibt bis BOOT-Taster; 0: fällt nach HOLD ab, wenn Ursache weg
 #define WARN_HOLD_MS         15000
 #define BUTTON_DEBOUNCE_MS   40
+#define BUTTON_LONG_MS       3000   // BOOT so lange halten: Fingerprints (IE-Hash, TSF) neu lernen
 
 // =====================================================================
 // Pins (Waveshare ESP32-C6-LCD-1.47)
