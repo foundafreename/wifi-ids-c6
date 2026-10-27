@@ -858,6 +858,29 @@ static void fmtUptime(char* out, size_t n) {
     else   snprintf(out, n, "%02lu:%02lu:%02lu", (unsigned long)h, (unsigned long)m, (unsigned long)s);
 }
 
+// Zwei Zeilen Klartext je Alarm-/Warngrund, max. 42 Zeichen pro Zeile (DejaVu 13 auf 308 px)
+static void explain(const char* reason, const char*& l1, const char*& l2) {
+    struct Ex { const char* key; const char* a; const char* b; };
+    static const Ex tab[] = {
+        { "DEAUTH eig. BSSID",   "Jemand wirft Geräte aus deinem WLAN.",      "Wer: siehe Serial. WPA3-Geräte sind immun." },
+        { "DEAUTH gespooft",     "Deauths mit deiner BSSID, aber falscher",    "Signalstärke: nicht vom Router. Angriff." },
+        { "DEAUTH-Flut",         "Deauth-Flut gegen ein fremdes Netz.",       "Nicht dein WLAN, aber jemand in Reichweite." },
+        { "DEAUTH vom AP",       "Dein Router selbst trennt Geräte.",         "Meist ein Gerät in der Reconnect-Schleife." },
+        { "EVIL TWIN",           "Fremder AP sendet deine SSID.",             "Nicht verbinden, Passwort nirgends eingeben." },
+        { "BSSID GEKLONT (IE)",  "Beacon mit deiner BSSID, anderer Aufbau.",  "Zweiter Sender oder Router-Update. BOOT 3 s." },
+        { "BSSID GEKLONT (TSF)", "Zwei Uhren hinter deiner BSSID.",           "Ein zweites Gerät imitiert deinen Router." },
+        { "BSSID ohne RSN",      "Dein Router sendet ohne Verschlüsselung.",  "Router-Einstellungen prüfen." },
+        { "SSID offen",          "Deine SSID wird unverschlüsselt gesendet.", "Fremder AP oder Router falsch konfiguriert." },
+        { "KANAL abweichend",    "Router auf anderem Kanal als erwartet.",    "Autokanal oder Einstellung geändert." },
+        { "AP STILL",            "Kein Beacon vom Router.",                   "Router aus, Kanal gewechselt oder gestört." },
+        { "TSF-Sprung",          "Die Uhr deines Routers ist gesprungen.",    "Einmal: Neustart. Mehrfach: Klon." },
+        { "FINGERPRINT NEU",     "Fingerprints gelöscht.",                    "Werden beim nächsten Beacon neu gelernt." },
+    };
+    l1 = l2 = nullptr;
+    for (const Ex& e : tab)
+        if (strcmp(e.key, reason) == 0) { l1 = e.a; l2 = e.b; return; }
+}
+
 static void draw(Level lvl, bool blinkOn) {
     LovyanGFX& g = fbOk ? static_cast<LovyanGFX&>(fb) : static_cast<LovyanGFX&>(lcd);
     uint16_t bg, fg = TFT_WHITE;
@@ -898,22 +921,38 @@ static void draw(Level lvl, bool blinkOn) {
     // Trennlinie
     g.drawFastHLine(6, 98, W - 12, fg);
 
-    // Statuszeilen (Font2, 16 px, 3 Zeilen)
+    // Unterer Block (Font2, 3 Zeilen): bei OK drei Statuszeilen, bei WARN/ALARM
+    // zwei Zeilen Erklärung und eine komprimierte Statuszeile
     const int lh = 18;
     int y = 104;
-    snprintf(line, sizeof line, "Deauth/s %.1f (ch%u)   eigene %.1f", dispDeauthRate, dispDeauthCh, dispDeauthMine);
-    g.drawString(line, 6, y); y += lh;
+    const char* ex1 = nullptr; const char* ex2 = nullptr;
+    if (lvl != LVL_OK) explain(reason, ex1, ex2);
 
-    if (twinCh) snprintf(line, sizeof line, "Twin %s  ch%u  %d dBm", twinBssid, twinCh, twinRssi);
-    else        snprintf(line, sizeof line, "Twin %s", twinBssid);
-    g.drawString(line, 6, y); y += lh;
+    if (ex1) {
+        g.drawString(ex1, 6, y); y += lh;
+        g.drawString(ex2 ? ex2 : "", 6, y); y += lh;
+        if (ownBeaconSeen)
+            snprintf(line, sizeof line, "Deauth/s %.1f  Twin %s  ch%u, AP vor %lu s", dispDeauthMine,
+                     twinCh ? "ja" : "-", curCh, (unsigned long)((millis() - lastOwnBeaconMs) / 1000));
+        else
+            snprintf(line, sizeof line, "Deauth/s %.1f  Twin %s  ch%u, AP fehlt", dispDeauthMine,
+                     twinCh ? "ja" : "-", curCh);
+        g.drawString(line, 6, y);
+    } else {
+        snprintf(line, sizeof line, "Deauth/s %.1f (ch%u)   eigene %.1f", dispDeauthRate, dispDeauthCh, dispDeauthMine);
+        g.drawString(line, 6, y); y += lh;
 
-    if (ownBeaconSeen)
-        snprintf(line, sizeof line, "Scan ch%u   AP ch%u, vor %lu s", curCh, lastOwnBeaconCh,
-                 (unsigned long)((millis() - lastOwnBeaconMs) / 1000));
-    else
-        snprintf(line, sizeof line, "Scan ch%u   AP nicht gesehen", curCh);
-    g.drawString(line, 6, y);
+        if (twinCh) snprintf(line, sizeof line, "Twin %s  ch%u  %d dBm", twinBssid, twinCh, twinRssi);
+        else        snprintf(line, sizeof line, "Twin %s", twinBssid);
+        g.drawString(line, 6, y); y += lh;
+
+        if (ownBeaconSeen)
+            snprintf(line, sizeof line, "Scan ch%u   AP ch%u, vor %lu s", curCh, lastOwnBeaconCh,
+                     (unsigned long)((millis() - lastOwnBeaconMs) / 1000));
+        else
+            snprintf(line, sizeof line, "Scan ch%u   AP nicht gesehen", curCh);
+        g.drawString(line, 6, y);
+    }
 
     // Kanalbalken unten: 13 Segmente, aktueller Kanal hell, Heimkanal markiert
     {
