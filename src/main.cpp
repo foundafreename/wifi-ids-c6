@@ -84,12 +84,13 @@
 #define BUTTON_DOUBLE_MS 350
 #endif
 #define IE_HASH_VERSION 2   // hochzählen, wenn sich ändert, was in den Hash eingeht
-#include "font_fira_r11.h"    // Fira Sans, Latin-1, generiert mit tools/gen_gfxfont.py
-#include "font_fira_r13.h"
-#include "font_fira_s12.h"
-#include "font_fira_s19.h"
-#include "font_fira_b24.h"
-#include "font_fira_b46.h"    // nur Ziffern und Satzzeichen, fuer die grosse Uhr
+#include "font_fira_r13.h"    // Fira Sans, Latin-1, generiert mit tools/gen_gfxfont.py
+#include "font_fira_r16.h"
+#include "font_fira_s14.h"
+#include "font_fira_s22.h"
+#include "font_fira_b30.h"
+#include "font_fira_b46.h"    // nur Ziffern und Satzzeichen, fuer die grosse Uhr (quer)
+#include "font_fira_b56.h"    // dito, hochkant
 
 #if NTFY_ENABLE
 #include <HTTPClient.h>
@@ -1153,14 +1154,14 @@ static void fillSquircle(LovyanGFX& g, int x, int y, int w, int h, int r, uint8_
 }
 
 static void pill(LovyanGFX& g, int x, int y, int h, const char* text, uint32_t accent, uint8_t tintAlpha, float dot) {
-    g.setFont(&FiraS12);
+    g.setFont(&FiraS14);
     const int tw = g.textWidth(text);
-    const int w = 5 + 8 + 5 + tw + 8;
+    const int w = 6 + 8 + 6 + tw + 9;
     g.fillRectAlpha(x, y, w, h, tintAlpha, accent);
-    g.fillSmoothCircle(x + 5 + 4, y + h / 2, 4, g.color888((uint8_t)(((accent >> 16) & 0xff) * dot), (uint8_t)(((accent >> 8) & 0xff) * dot), (uint8_t)((accent & 0xff) * dot)));
+    g.fillSmoothCircle(x + 6 + 4, y + h / 2, 4, g.color888((uint8_t)(((accent >> 16) & 0xff) * dot), (uint8_t)(((accent >> 8) & 0xff) * dot), (uint8_t)((accent & 0xff) * dot)));
     g.setTextDatum(textdatum_t::middle_left);
     g.setTextColor(accent == C_OK ? C_TXT1 : accent);
-    g.drawString(text, x + 5 + 8 + 5, y + h / 2);
+    g.drawString(text, x + 6 + 8 + 6, y + h / 2);
 }
 
 static void drawRing(LovyanGFX& g, int cx, int cy, int r, int sw, float frac, uint32_t accent, float bright) {
@@ -1221,111 +1222,111 @@ static void draw(Level lvl) {
 
     g.fillScreen(C_GROUND);
     char line[64], ts[16];
+    const int m = 6;
 
     // Kopf: Pill links, Uhr rechts
-    const int m = portrait ? 6 : 8;
-    pill(g, m, 6, 20, lvl == LVL_ALARM ? "ALARM" : lvl == LVL_WARN ? "WARNUNG" : "AKTIV", accent,
+    pill(g, m, 6, 22, lvl == LVL_ALARM ? "ALARM" : lvl == LVL_WARN ? "WARNUNG" : "AKTIV", accent,
          lvl == LVL_ALARM ? 46 : lvl == LVL_WARN ? 36 : 15, lvl == LVL_ALARM ? bright : 1.0f);
     const bool haveTime = timeValid();
     if (haveTime) fmtClock(ts, sizeof ts, time(nullptr)); else fmtUptime(ts, sizeof ts);
-    g.setFont(&FiraR13);
+    g.setFont(&FiraR16);
     g.setTextColor(C_TXT1);
     g.setTextDatum(textdatum_t::middle_right);
-    g.drawString(ts, W - m, 16);
+    g.drawString(ts, W - m, 17);
     if (lvl != LVL_OK) {
         char a[8], b[8];
         if (lvl == LVL_ALARM && alarmSinceT) { fmtClockShort(a, sizeof a, alarmSinceT); fmtClockShort(b, sizeof b, alarmLastT); snprintf(line, sizeof line, "%s bis %s · #%lu", a, b, (unsigned long)alarmCount); }
         else if (lvl == LVL_ALARM)          snprintf(line, sizeof line, "seit %lu s · #%lu", (unsigned long)((millis() - alarmSince) / 1000), (unsigned long)alarmCount);
         else                                snprintf(line, sizeof line, "vor %lu s", (unsigned long)((millis() - warnLast) / 1000));
-        g.setFont(&FiraR11);
+        g.setFont(&FiraR13);
         g.setTextColor(C_TXT3);
         g.setTextDatum(textdatum_t::middle_right);
-        g.drawString(line, W - m - (portrait ? 0 : g.textWidth(ts) + 8), portrait ? 30 : 16);
+        if (portrait) g.drawString(line, W - m, 36);
+        else          g.drawString(line, W - m - g.textWidth(ts, &FiraR16) - 10, 17);
     }
 
     // Ring
-    int rcx, rcy, rr;
-    if (!portrait) { rcx = 46; rcy = 78; rr = 36; }
-    else           { rcx = W / 2; rcy = lvl == LVL_OK ? 90 : 76; rr = lvl == LVL_OK ? 46 : 40; }
-    drawRing(g, rcx, rcy, rr, 7, lvl == LVL_OK ? ringShown : fmaxf(ringShown, 0.02f), accent, bright);
+    int rcx, rcy, rr, sw;
+    if (!portrait) { rcx = 50; rcy = 92; rr = 40; sw = 8; }
+    else           { rcx = W / 2; rcy = lvl == LVL_OK ? 102 : 96; rr = lvl == LVL_OK ? 52 : 46; sw = 9; }
+    drawRing(g, rcx, rcy, rr, sw, lvl == LVL_OK ? ringShown : fmaxf(ringShown, 0.02f), accent, bright);
     snprintf(line, sizeof line, lvl == LVL_ALARM && dispDeauthMine >= 10 ? "%.0f" : "%.1f", dispDeauthMine);
     for (char* c = line; *c; c++) if (*c == '.') *c = ',';
-    g.setFont(&FiraB24);
+    g.setFont(&FiraB30);
     g.setTextColor(C_TXT1);
     g.setTextDatum(textdatum_t::middle_center);
-    g.drawString(line, rcx, rcy - 4);
-    g.setFont(&FiraR11);
+    g.drawString(line, rcx, rcy - 7);
+    g.setFont(&FiraR13);
     g.setTextColor(C_TXT3);
-    g.drawString("Deauth/s", rcx, rcy + 14);
+    g.drawString("Deauth/s", rcx, rcy + 15);
 
     if (lvl == LVL_OK) {
-        // grosse Uhr und Datum
+        char last[8] = "";
+        if (alarmLastT) fmtClockShort(last, sizeof last, alarmLastT);
         if (haveTime) {
             const time_t t = time(nullptr); struct tm tmv; localtime_r(&t, &tmv);
             strftime(ts, sizeof ts, "%H:%M", &tmv);
             snprintf(line, sizeof line, "%s, %d. %s", WDAY[tmv.tm_wday], tmv.tm_mday, MONTH[tmv.tm_mon]);
-            g.setFont(&FiraB46);
             g.setTextColor(C_TXT1);
-            if (!portrait) { g.setTextDatum(textdatum_t::middle_right);  g.drawString(ts, W - m, 76); }
-            else           { g.setTextDatum(textdatum_t::middle_center); g.drawString(ts, W / 2, 176); }
-            g.setFont(&FiraR11);
-            g.setTextColor(C_TXT3);
-            if (!portrait) g.drawString(line, W - m, 106); else g.drawString(line, W / 2, 206);
-        } else {
+            if (!portrait) { g.setFont(&FiraB46); g.setTextDatum(textdatum_t::middle_right);  g.drawString(ts, W - m, 84); }
+            else           { g.setFont(&FiraB56); g.setTextDatum(textdatum_t::middle_center); g.drawString(ts, W / 2, 196); }
             g.setFont(&FiraR13);
             g.setTextColor(C_TXT3);
+            if (!portrait) g.drawString(line, W - m, 116); else g.drawString(line, W / 2, 234);
+        } else {
+            g.setFont(&FiraR16);
+            g.setTextColor(C_TXT3);
             g.setTextDatum(portrait ? textdatum_t::middle_center : textdatum_t::middle_right);
-            g.drawString("keine Uhrzeit", portrait ? W / 2 : W - m, portrait ? 176 : 80);
+            g.drawString("keine Uhrzeit", portrait ? W / 2 : W - m, portrait ? 196 : 90);
         }
-        // Infozeile(n)
-        char last[8] = "";
-        if (alarmLastT) fmtClockShort(last, sizeof last, alarmLastT);
-        g.setFont(&FiraR11);
+        g.setFont(&FiraR13);
         g.setTextColor(C_TXT4);
         if (!portrait) {
             g.setTextDatum(textdatum_t::middle_left);
-            if (ownBeaconSeen) snprintf(line, sizeof line, "Netz unauffällig · AP ch%u vor %lu s%s%s", lastOwnBeaconCh, (unsigned long)((millis() - lastOwnBeaconMs) / 1000), last[0] ? " · letzter Alarm " : "", last);
+            if (ownBeaconSeen) snprintf(line, sizeof line, "Netz unauffällig · AP ch%u vor %lu s", lastOwnBeaconCh, (unsigned long)((millis() - lastOwnBeaconMs) / 1000));
             else               snprintf(line, sizeof line, "Netz unauffällig · AP nicht gesehen");
-            g.drawString(line, m, 136);
+            g.drawString(line, m, 140);
+            if (last[0]) { snprintf(line, sizeof line, "letzter Alarm %s", last); g.setTextDatum(textdatum_t::middle_right); g.drawString(line, W - m, 140); }
         } else {
             g.setTextDatum(textdatum_t::middle_center);
-            g.drawString("Netz unauffällig", W / 2, 246);
+            g.drawString("Netz unauffällig", W / 2, 262);
             if (ownBeaconSeen) snprintf(line, sizeof line, "AP ch%u vor %lu s", lastOwnBeaconCh, (unsigned long)((millis() - lastOwnBeaconMs) / 1000));
             else               snprintf(line, sizeof line, "AP nicht gesehen");
-            g.drawString(line, W / 2, 262);
-            if (last[0]) { snprintf(line, sizeof line, "letzter Alarm %s", last); g.drawString(line, W / 2, 278); }
+            g.drawString(line, W / 2, 279);
+            if (last[0]) { snprintf(line, sizeof line, "letzter Alarm %s", last); g.drawString(line, W / 2, 296); }
         }
     } else {
         // Glaskarte
         int cx, cy, cw, ch;
-        if (!portrait) { cx = 98; cy = 42; cw = W - 98 - m; ch = 80; }
-        else           { cx = m; cy = 126; cw = W - 2 * m; ch = 88; }
+        if (!portrait) { cx = 100; cy = 42; cw = W - 100 - m; ch = 86; }
+        else           { cx = m; cy = 148; cw = W - 2 * m; ch = 90; }
         fillSquircle(g, cx, cy, cw, ch, 12, lvl == LVL_ALARM ? 40 : 26, accent);
         g.setTextDatum(textdatum_t::middle_left);
-        g.setFont(&FiraS19);
+        g.setFont(&FiraS22);
         g.setTextColor(C_TXT1);
-        g.drawString(reason, cx + 11, cy + 18);
-        g.setFont(&FiraR13);
+        g.drawString(reason, cx + 10, cy + 20);
+        g.setFont(&FiraR16);
         g.setTextColor(C_TXT2);
-        g.drawString(detail, cx + 11, cy + 42);
+        g.drawString(detail, cx + 10, cy + 47);
+        g.setFont(&FiraR13);
         g.setTextColor(C_TXT3);
         if (twinCh) snprintf(line, sizeof line, "Twin ch%u %d dBm", twinCh, twinRssi);
         else if (ownBeaconSeen) snprintf(line, sizeof line, "AP ch%u vor %lu s · Twin nein", lastOwnBeaconCh, (unsigned long)((millis() - lastOwnBeaconMs) / 1000));
         else snprintf(line, sizeof line, "AP nicht gesehen");
-        g.drawString(line, cx + 11, cy + 62);
+        g.drawString(line, cx + 10, cy + 70);
         // Erklaerung, umgebrochen
-        char lines[4][64];
-        g.setFont(&FiraR13);
-        const int n = wrapText(g, explain(reason), W - 2 * m, lines, portrait ? 4 : 2);
-        int y = portrait ? 230 : 130;
+        char lines[3][64];
+        g.setFont(&FiraR16);
+        const int n = wrapText(g, explain(reason), W - 2 * m, lines, portrait ? 3 : 2);
+        int y = portrait ? 254 : 140;
         for (int i = 0; i < n; i++) {
             g.setTextColor(i == 0 ? C_TXT1 : C_TXT3);
             g.drawString(lines[i], m, y);
-            y += 16;
+            y += 19;
         }
     }
 
-    dots(g, m + 4, W - m - 4, H - 10, accent);
+    dots(g, m + 4, W - m - 4, H - 8, accent);
     if (fbOk) fb.pushSprite(0, 0);
 }
 
@@ -1419,7 +1420,7 @@ void setup() {
     applyRotation(prefs.getUChar("rot", LCD_ROTATION));
     lcd.fillScreen(TFT_BLACK);
     lcd.setTextColor(TFT_WHITE);
-    lcd.setFont(&FiraR13);
+    lcd.setFont(&FiraR16);
     lcd.drawString("WLAN-IDS startet", 6, 6);
 
 #if CHECK_IE_HASH
