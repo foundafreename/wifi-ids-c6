@@ -170,6 +170,7 @@ class Bridge:
         self.devices = self._load_devices()
         self.ser = None
         self.last_sync = 0
+        self.time_acked = False      # bis das Board EV TIME schickt: alle 15 s neu senden
 
     # -- Geräteliste --------------------------------------------------------
     def _load_devices(self):
@@ -234,7 +235,8 @@ class Bridge:
     def _read_loop(self):
         while True:
             raw = self.ser.readline()
-            if time.time() - self.last_sync > self.cfg["sync_interval_s"]:
+            interval = self.cfg["sync_interval_s"] if self.time_acked else 15
+            if time.time() - self.last_sync > interval:
                 self.send_time()
             if not raw:
                 continue
@@ -253,7 +255,11 @@ class Bridge:
         ts = datetime.now().strftime("%H:%M:%S")
 
         if kind == "BOOT":
+            self.time_acked = False
             self.send_time()
+            return
+        if kind == "TIME":
+            self.time_acked = True
             return
         if kind == "ALARM" and "ALARM" in self.events:
             reason, detail = (args + ["", ""])[:2]

@@ -14,6 +14,7 @@
 #include <sys/time.h>
 #include <math.h>
 #include <esp_timer.h>
+#include <hal/usb_serial_jtag_ll.h>
 #include "config.h"
 
 // Defaults für ältere private config.h ohne die neuen Schalter
@@ -443,6 +444,7 @@ static bool     ntfyPending = false;
 static uint32_t alarmCount = 0;
 
 static Preferences prefs;
+static uint32_t rxBytes;
 
 // Fingerprint je Whitelist-Eintrag (Regel 2b, Regel 6)
 struct Fingerprint {
@@ -897,7 +899,7 @@ static void printCalib() {
                          (unsigned long)n, -(long)(uniRssiSum.load() / n), (int)uniRssiLast.load());
     else   Serial.println(", noch kein Unicast-Mgmt vom AP gesehen (Auth/Assoc/Action)");
     if (WHITELIST_COUNT > 0 && fp[0].rssiValid)
-        Serial.printf("EV CALIB|%d|%lu|%ld\n", fp[0].rssiEma4 / 4, (unsigned long)n, n ? -(long)(uniRssiSum.load() / n) : 0L);
+        Serial.printf("EV CALIB|%d|%lu|%ld|rx=%lu\n", fp[0].rssiEma4 / 4, (unsigned long)n, n ? -(long)(uniRssiSum.load() / n) : 0L, (unsigned long)rxBytes);
 }
 
 static void relearnFingerprints();
@@ -930,33 +932,44 @@ static void processClients() {
 }
 
 // Serial-Kommandos. Einzelzeichen sofort (d, r, h), "T<unix>\n" zeilenweise.
-static void pollSerial() {
+// Zwei Quellen: der Arduino-HWCDC-Puffer und, falls dessen RX-Interrupt
+// nicht feuert (auf dem C6 beobachtet), der USB-Serial-JTAG-RX-FIFO direkt.
+static void handleSerialChar(char c) {
     static char buf[24];
     static uint8_t n = 0;
-    while (Serial.available()) {
-        const char c = (char)Serial.read();
-        if (n == 0 && (c == 'd' || c == 'r' || c == 'h' || c == '?')) {
-            if (c == 'd')      { printSavedEvidence(); dumpEvidence("Beweis-Log (RAM)"); printCalib(); }
-            else if (c == 'r') relearnFingerprints();
-            else Serial.println("d = Beweis-Log, r = Fingerprints neu lernen, T<unix> = Zeit setzen");
-            continue;
-        }
-        if (c == '\n' || c == '\r') {
-            buf[n] = 0;
-            if (n > 1 && buf[0] == 'T') {
-                const time_t t = (time_t)strtoul(buf + 1, nullptr, 10);
-                if (t > 1700000000) {
-                    struct timeval tv = { .tv_sec = t, .tv_usec = 0 };
-                    settimeofday(&tv, nullptr);
-                    char ts[16]; fmtClock(ts, sizeof ts, t);
-                    Serial.printf("Zeit gesetzt: %s\nEV TIME|%lu\n", ts, (unsigned long)t);
-                } else Serial.println("T: ungültig");
-            }
-            n = 0;
-            continue;
-        }
-        if (n < sizeof buf - 1) buf[n++] = c; else n = 0;
+    rxBytes++;
+    if (n == 0 && (c == 'd' || c == 'r' || c == 'h' || c == '?')) {
+        if (c == 'd')      { printSavedEvidence(); dumpEvidence("Beweis-Log (RAM)"); printCalib(); }
+        else if (c == 'r') relearnFingerprints();
+        else Serial.println("d = Beweis-Log, r = Fingerprints neu lernen, T<unix> = Zeit setzen");
+        return;
     }
+    if (c == '\n' || c == '\r') {
+        buf[n] = 0;
+        if (n > 1 && buf[0] == 'T') {
+            const time_t t = (time_t)strtoul(buf + 1, nullptr, 10);
+            if (t > 1700000000) {
+                struct timeval tv = { .tv_sec = t, .tv_usec = 0 };
+                settimeofday(&tv, nullptr);
+                char ts[16]; fmtClock(ts, sizeof ts, t);
+                Serial.printf("Zeit gesetzt: %s\nEV TIME|%lu\n", ts, (unsigned long)t);
+            } else Serial.println("T: ungültig");
+        }
+        n = 0;
+        return;
+    }
+    if (n < sizeof buf - 1) buf[n++] = c; else n = 0;
+}
+
+static void pollSerial() {
+    while (Serial.available() > 0) handleSerialChar((char)Serial.read());
+#if ARDUINO_USB_CDC_ON_BOOT
+    if (usb_serial_jtag_ll_rxfifo_data_available()) {
+        uint8_t raw[64];
+        const int n = usb_serial_jtag_ll_read_rxfifo(raw, sizeof raw);
+        for (int i = 0; i < n; i++) handleSerialChar((char)raw[i]);
+    }
+#endif
 }
 
 // Gelernte Fingerprints verwerfen (nach Router-Update oder Konfigänderung)
