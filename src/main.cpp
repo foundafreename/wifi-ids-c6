@@ -12,6 +12,8 @@
 #include <Preferences.h>
 #include <time.h>
 #include <sys/time.h>
+#include <math.h>
+#include <esp_timer.h>
 #include "config.h"
 
 // Defaults für ältere private config.h ohne die neuen Schalter
@@ -59,6 +61,24 @@
 #endif
 #ifndef TIMEZONE
 #define TIMEZONE "CET-1CEST,M3.5.0,M10.5.0/3"
+#endif
+#ifndef LED_WARN_PERIOD_MS
+#define LED_WARN_PERIOD_MS 800
+#endif
+#ifndef LED_WARN_RAMP_MS
+#define LED_WARN_RAMP_MS 640
+#endif
+#ifndef LED_ALARM_PERIOD_MS
+#define LED_ALARM_PERIOD_MS 300
+#endif
+#ifndef LED_ALARM_RAMP_MS
+#define LED_ALARM_RAMP_MS 240
+#endif
+#ifndef LED_GAMMA
+#define LED_GAMMA 2.2f
+#endif
+#ifndef LED_TICK_MS
+#define LED_TICK_MS 4
 #endif
 #define IE_HASH_VERSION 2   // hochzählen, wenn sich ändert, was in den Hash eingeht
 #include "font_dejavu_13.h"   // Latin-1 (Umlaute), generiert mit tools/gen_gfxfont.py
@@ -980,44 +1000,65 @@ static inline void ledWrite(uint8_t r, uint8_t g, uint8_t b) {
 #endif
 }
 
-// Gamma, damit der lineare Ramp-down visuell linear wirkt (WS2812 ist bei <10 % schon hell)
-static uint8_t gammaLed(uint8_t v) {
-    const uint32_t x = v;
-    return (uint8_t)((x * x * x + 32512) / 65025);   // v^3 / 255^2
+// Eine Hüllkurve für alle Stufen: sofort auf Max, dann Ramp-down über
+// LED_*_RAMP_MS, Rest der Periode dunkel. Läuft im esp_timer alle LED_TICK_MS,
+// unabhängig vom loop(), damit der 25-ms-Display-Push keine Stufen frisst.
+// 16-Bit-Rechnung plus zeitliches Dithering: die WS2812 kann nur 8 Bit, am
+// Rampenende sind das die Werte 3, 2, 1, 0 mit riesigen relativen Sprüngen.
+// Der Fehler zwischen Soll (16 Bit) und Ist (8 Bit) wird in den nächsten
+// Tick mitgenommen, die LED wechselt dann schnell zwischen n und n+1.
+static volatile Level ledLevel = LVL_OK;
+static esp_timer_handle_t ledTimer = nullptr;
+
+struct LedPattern { uint8_t r, g, b; uint16_t periodMs, rampMs; uint16_t minLevel; };
+static const LedPattern LED_PAT[3] = {
+    { 0,   255, 0,   LED_OK_PERIOD_MS,    LED_OK_RAMP_MS,    LED_OK_MIN * 257u },
+    { 255, 140, 0,   LED_WARN_PERIOD_MS,  LED_WARN_RAMP_MS,  0 },
+    { 255, 0,   0,   LED_ALARM_PERIOD_MS, LED_ALARM_RAMP_MS, 0 },
+};
+
+// Gamma 2,2 auf 16 Bit, Eingang 0..65535
+static uint16_t gamma16(uint16_t v) {
+    const float x = v / 65535.0f;
+    return (uint16_t)(powf(x, LED_GAMMA) * 65535.0f + 0.5f);
 }
 
-static void updateLed(Level lvl) {
-    static uint32_t lastUpd = 0;
+static void ledTick(void*) {
     static Level    lastLvl = LVL_OK;
-    static uint32_t phase0 = 0;
-    const uint32_t now = millis();
-    if (now - lastUpd < LED_UPDATE_MS) return;
-    lastUpd = now;
-    if (lvl != lastLvl) { lastLvl = lvl; phase0 = now; }   // Muster bei Statuswechsel neu starten
-    const uint32_t t = now - phase0;
+    static int64_t  phase0 = 0;
+    static int32_t  err[3] = {0, 0, 0};
+    const int64_t nowUs = esp_timer_get_time();
+    const Level lvl = ledLevel;
+    if (lvl != lastLvl) { lastLvl = lvl; phase0 = nowUs; err[0] = err[1] = err[2] = 0; }
+    const LedPattern& pat = LED_PAT[lvl];
+    const uint32_t t = (uint32_t)((nowUs - phase0) / 1000) % pat.periodMs;
 
-    switch (lvl) {
-        case LVL_OK: {
-            const uint32_t p = t % LED_OK_PERIOD_MS;
-            uint8_t v = LED_OK_MIN;
-            if (p < LED_OK_RAMP_MS)
-                v = LED_OK_MAX - (uint32_t)(LED_OK_MAX - LED_OK_MIN) * p / LED_OK_RAMP_MS;
-            ledWrite(0, gammaLed(v), 0);
-            break;
-        }
-        case LVL_WARN: {
-            const uint32_t half = 1000 / (2 * LED_WARN_HZ);
-            const bool on = (t / half) & 1;
-            ledWrite(on ? LED_WARN_LEVEL : 0, on ? LED_WARN_LEVEL * 55 / 100 : 0, 0);
-            break;
-        }
-        case LVL_ALARM: {
-            const bool red = (t / LED_ALARM_STROBE_MS) & 1;
-            ledWrite(red ? 255 : 0, 0, red ? 0 : 255);
-            break;
-        }
+    // Hüllkurve linear in 16 Bit, dann Gamma
+    uint32_t lin = pat.minLevel;
+    if (t < pat.rampMs) lin = 65535u - (uint32_t)(65535u - pat.minLevel) * t / pat.rampMs;
+    const uint32_t env = gamma16((uint16_t)lin);
+
+    uint8_t out[3];
+    const uint8_t col[3] = { pat.r, pat.g, pat.b };
+    for (int i = 0; i < 3; i++) {
+        const int32_t want = (int32_t)(env * col[i] / 255) + err[i];   // 16-Bit-Soll inkl. Restfehler
+        int32_t q = (want + 128) / 257;                                 // auf 8 Bit runden
+        if (q < 0) q = 0; if (q > 255) q = 255;
+        err[i] = want - q * 257;
+        if (err[i] > 257) err[i] = 257; if (err[i] < -257) err[i] = -257;
+        out[i] = (uint8_t)q;
     }
+    ledWrite(out[0], out[1], out[2]);
 }
+
+static void startLed() {
+    const esp_timer_create_args_t a = { .callback = &ledTick, .arg = nullptr,
+                                        .dispatch_method = ESP_TIMER_TASK, .name = "led", .skip_unhandled_events = true };
+    esp_timer_create(&a, &ledTimer);
+    esp_timer_start_periodic(ledTimer, (uint64_t)LED_TICK_MS * 1000);
+}
+
+static void updateLed(Level lvl) { ledLevel = lvl; }
 
 static void fmtUptime(char* out, size_t n) {
     uint32_t s = millis() / 1000;
@@ -1260,6 +1301,7 @@ void setup() {
     esp_wifi_set_country(&country);
     esp_wifi_set_ps(WIFI_PS_NONE);
 
+    startLed();
     startSniffer();
     setenv("TZ", TIMEZONE, 1);
     tzset();

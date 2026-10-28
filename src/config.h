@@ -132,15 +132,17 @@ static const ApEntry WHITELIST[] = {
 #define LCD_ROTATION         1      // 1 = quer, USB links; 3 = quer, USB rechts
 #define BLINK_MS             400    // Display-Blinken bei ALARM
 #define REDRAW_MS            250
-// LED-Muster
-#define LED_OK_MAX           255    // OK: sofort auf Max, dann linear runter
-#define LED_OK_MIN           4
-#define LED_OK_PERIOD_MS     2000   // Pulsperiode
-#define LED_OK_RAMP_MS       1600   // Ramp-down-Anteil (Rest: dunkel bis zum nächsten Puls)
-#define LED_WARN_HZ          4      // gelb, 50 % Duty
-#define LED_WARN_LEVEL       200
-#define LED_ALARM_STROBE_MS  50     // rot/blau wechselnd, 100 %
-#define LED_UPDATE_MS        10
+// LED-Muster: alle Stufen dieselbe Hüllkurve (sofort Max, Ramp-down, Rest dunkel),
+// nur Farbe und Tempo unterscheiden sich. Läuft im Timer, 16 Bit mit Dithering.
+#define LED_OK_MIN           4      // OK: Sockel, damit die LED nie ganz aus ist
+#define LED_OK_PERIOD_MS     2000
+#define LED_OK_RAMP_MS       1600
+#define LED_WARN_PERIOD_MS   800    // amber
+#define LED_WARN_RAMP_MS     640
+#define LED_ALARM_PERIOD_MS  300    // rot, schnell
+#define LED_ALARM_RAMP_MS    240
+#define LED_GAMMA            2.2f
+#define LED_TICK_MS          4
 #define LED_SWAP_RG          1      // 1: LED erwartet RGB statt GRB (Waveshare-Board: Gruen kam als Rot)
 
 // =====================================================================

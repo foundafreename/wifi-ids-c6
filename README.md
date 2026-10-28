@@ -59,7 +59,7 @@ Mesh repeaters broadcasting the same SSID have to go into the whitelist too, or 
 - Channel hopping is park-and-sweep: 20 s on the home channel, then 13 x 150 ms across the rest. Deauth rates are computed per channel against airtime, not wall clock, otherwise hopping would dilute a flood by a factor of 13. The trade-off table is in `config.h`.
 - The sender's channel comes from the DS Parameter IE, not from `rx_ctrl.channel` (adjacent-channel bleed).
 - Display is 320x172 landscape via LovyanGFX, framebuffer as a sprite. Fonts are custom GFX fonts with Latin-1 (`tools/gen_gfxfont.py`), the bundled ones can't do umlauts.
-- LED: pulsing green is OK, yellow at 4 Hz is WARN, red/blue strobe is ALARM. The board wants RGB instead of GRB, hence `LED_SWAP_RG`.
+- LED: one envelope for every state, full on then a ramp down, the rest of the period dark. Green every 2 s is OK, amber every 0.8 s is WARN, red every 0.3 s is ALARM. Runs on an esp_timer at 250 Hz with 16 bit math and temporal dithering, so the tail of the ramp doesn't step. The board wants RGB instead of GRB, hence `LED_SWAP_RG`.
 
 ## Things to know
 
@@ -138,7 +138,7 @@ Mesh-Repeater mit gleicher SSID müssen mit in die Whitelist, sonst Dauer-Twin-A
 - Kanal-Hopping als Park-und-Sweep: 20 s auf dem Heimkanal, dann 13 x 150 ms über alle anderen. Deauth-Raten werden pro Kanal auf Airtime bezogen, nicht auf die Wanduhr, sonst würde das Hopping eine Flut um Faktor 13 verdünnen. Trade-off-Tabelle in `config.h`.
 - Der Kanal des Senders kommt aus der DS-Parameter-IE, nicht aus `rx_ctrl.channel` (Nachbarkanal-Bleed).
 - Display 320x172 quer über LovyanGFX, Framebuffer als Sprite. Fonts sind eigene GFXfonts mit Latin-1 (`tools/gen_gfxfont.py`), die mitgelieferten können kein ä.
-- LED: grün pulsend ist OK, gelb 4 Hz ist WARN, rot/blau-Strobe ist ALARM. Das Board will RGB statt GRB, deshalb `LED_SWAP_RG`.
+- LED: eine Hüllkurve für alle Stufen, sofort an, dann Rampe runter, Rest der Periode dunkel. Grün alle 2 s ist OK, amber alle 0,8 s ist WARN, rot alle 0,3 s ist ALARM. Läuft im esp_timer mit 250 Hz, 16 Bit und zeitlichem Dithering, damit das Rampenende nicht stuft. Das Board will RGB statt GRB, deshalb `LED_SWAP_RG`.
 
 ## Was man wissen sollte
 
