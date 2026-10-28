@@ -10,6 +10,8 @@
 #include <esp_wifi_types.h>
 #include <LovyanGFX.hpp>
 #include <Preferences.h>
+#include <time.h>
+#include <sys/time.h>
 #include "config.h"
 
 // Defaults für ältere private config.h ohne die neuen Schalter
@@ -54,6 +56,9 @@
 #endif
 #ifndef BUTTON_LONG_MS
 #define BUTTON_LONG_MS 3000
+#endif
+#ifndef TIMEZONE
+#define TIMEZONE "CET-1CEST,M3.5.0,M10.5.0/3"
 #endif
 #define IE_HASH_VERSION 2   // hochzählen, wenn sich ändert, was in den Hash eingeht
 #include "font_dejavu_13.h"   // Latin-1 (Umlaute), generiert mit tools/gen_gfxfont.py
@@ -167,6 +172,30 @@ static std::atomic<uint32_t> cntDeauthTotal{0};
 static std::atomic<uint32_t> cntDeauthMine{0};
 static std::atomic<uint32_t> cntMgmtTotal{0};
 
+// Client-Ereignisse (An-/Abmeldung), für die Pi-Bridge als EV-Zeilen
+enum : uint8_t { CE_AUTH = 1, CE_ASSOC_REQ, CE_JOIN, CE_JOIN_FAIL, CE_LEAVE, CE_KICK };
+struct ClientEvent {
+    uint8_t  mac[6];
+    uint8_t  kind;
+    uint8_t  subtype;
+    int8_t   rssi;
+    uint16_t code;       // Reason bzw. Status
+};
+static constexpr uint8_t CRING_SIZE = 16;
+static ClientEvent           cring[CRING_SIZE];
+static volatile uint8_t      cringHead = 0, cringTail = 0;
+static std::atomic<uint32_t> cringDrops{0};
+
+static void pushClient(const uint8_t* mac, uint8_t kind, uint8_t subtype, int8_t rssi, uint16_t code) {
+    const uint8_t head = cringHead;
+    const uint8_t next = (head + 1) & (CRING_SIZE - 1);
+    if (next == cringTail) { cringDrops.fetch_add(1, std::memory_order_relaxed); return; }
+    ClientEvent& c = cring[head];
+    memcpy(c.mac, mac, 6);
+    c.kind = kind; c.subtype = subtype; c.rssi = rssi; c.code = code;
+    cringHead = next;
+}
+
 // Regel-6-Kalibrierung: RSSI von Unicast-Management-Frames des eigenen AP
 static std::atomic<uint32_t> uniRssiSum{0};   // Summe der Beträge (RSSI ist negativ)
 static std::atomic<uint32_t> uniRssiN{0};
@@ -209,9 +238,13 @@ static void promiscCb(void* buf, wifi_promiscuous_pkt_type_t type) {
 
     cntMgmtTotal.fetch_add(1, std::memory_order_relaxed);
 
+    const bool a1Mine = whitelistIndex(a1) >= 0;
+    const bool a2Mine = whitelistIndex(a2) >= 0;
+
     if (subtype == 0x0C || subtype == 0x0A) {     // Deauth / Disassoc
         cntDeauthTotal.fetch_add(1, std::memory_order_relaxed);
-        if (whitelistIndex(a1) >= 0 || whitelistIndex(a2) >= 0 || whitelistIndex(a3) >= 0) {
+        const uint16_t reason = (len >= 26) ? (uint16_t)(p[24] | (p[25] << 8)) : 0;
+        if (a1Mine || a2Mine || whitelistIndex(a3) >= 0) {
             cntDeauthMine.fetch_add(1, std::memory_order_relaxed);
             const uint8_t head = dringHead;
             const uint8_t next = (head + 1) & (DRING_SIZE - 1);
@@ -219,21 +252,35 @@ static void promiscCb(void* buf, wifi_promiscuous_pkt_type_t type) {
             DeauthEvent& d = dring[head];
             memcpy(d.a1, a1, 6);
             memcpy(d.a2, a2, 6);
-            d.reason  = (len >= 26) ? (uint16_t)(p[24] | (p[25] << 8)) : 0;
+            d.reason  = reason;
             d.rssi    = pkt->rx_ctrl.rssi;
             d.ch      = pkt->rx_ctrl.channel;
             d.subtype = subtype;
             dringHead = next;
+            // Client-Sicht: Client verabschiedet sich selbst, oder AP wirft ihn raus
+            // (Reason 7 ist die Antwort auf Frames eines unbekannten Clients, kein Rauswurf)
+            if (!a2Mine && a1Mine)                            pushClient(a2, CE_LEAVE, subtype, pkt->rx_ctrl.rssi, reason);
+            else if (a2Mine && !a1Mine && reason != 7 && !(a1[0] & 1)) pushClient(a1, CE_KICK, subtype, pkt->rx_ctrl.rssi, reason);
         }
         return;
     }
     // Kalibrierung für Regel 6: Unicast-Management vom eigenen AP (Auth 0x0B,
     // Assoc Resp 0x01, Reassoc Resp 0x03, Action 0x0D) muss mit Beacon-RSSI
     // ankommen. Tut es das nicht, ist die RSSI-Regel am Standort unbrauchbar.
-    if ((subtype == 0x0B || subtype == 0x01 || subtype == 0x03 || subtype == 0x0D) && whitelistIndex(a2) >= 0) {
+    if ((subtype == 0x0B || subtype == 0x01 || subtype == 0x03 || subtype == 0x0D) && a2Mine) {
         uniRssiSum.fetch_add((uint32_t)(int32_t)(-pkt->rx_ctrl.rssi), std::memory_order_relaxed);
         uniRssiN.fetch_add(1, std::memory_order_relaxed);
         uniRssiLast.store(pkt->rx_ctrl.rssi, std::memory_order_relaxed);
+        // Assoc/Reassoc Response: Status-Code bei Body-Offset 2
+        if ((subtype == 0x01 || subtype == 0x03) && len >= 30) {
+            const uint16_t status = (uint16_t)(p[26] | (p[27] << 8));
+            pushClient(a1, status == 0 ? CE_JOIN : CE_JOIN_FAIL, subtype, pkt->rx_ctrl.rssi, status);
+        }
+        return;
+    }
+    // Client meldet sich an: Auth / Assoc Req / Reassoc Req an unsere BSSID
+    if ((subtype == 0x0B || subtype == 0x00 || subtype == 0x02) && a1Mine && !a2Mine) {
+        pushClient(a2, subtype == 0x0B ? CE_AUTH : CE_ASSOC_REQ, subtype, pkt->rx_ctrl.rssi, 0);
         return;
     }
     if (subtype != 0x08 && subtype != 0x05) return;   // nur Beacon / Probe Resp
@@ -347,6 +394,7 @@ static bool     stickyUsed = false;
 
 static bool     alarmLatched = false;
 static uint32_t alarmSince = 0, alarmLastCond = 0;
+static time_t   alarmSinceT = 0, alarmLastT = 0;   // Wallclock, 0 = unbekannt
 static char     alarmReason[24] = "", alarmDetail[40] = "";
 
 static uint32_t warnLast = 0;
@@ -405,6 +453,24 @@ static void macToStr(const uint8_t* m, char* out) {
     snprintf(out, 18, "%02X:%02X:%02X:%02X:%02X:%02X", m[0], m[1], m[2], m[3], m[4], m[5]);
 }
 
+// Wallclock kommt von außen (Serial "T<unix>", z. B. von der Pi-Bridge).
+// Ohne gesetzte Zeit bleibt alles bei Uptime.
+static bool timeValid() { return time(nullptr) > 1700000000; }
+static void fmtClock(char* out, size_t n, time_t t) {
+    struct tm tmv; localtime_r(&t, &tmv);
+    strftime(out, n, "%H:%M:%S", &tmv);
+}
+static void fmtClockShort(char* out, size_t n, time_t t) {
+    struct tm tmv; localtime_r(&t, &tmv);
+    strftime(out, n, "%H:%M", &tmv);
+}
+// Uptime-Millisekunden in Wallclock, wenn der Boot-Zeitpunkt bekannt ist
+static void fmtStamp(char* out, size_t n, uint32_t ms, time_t bootEpoch) {
+    if (bootEpoch) fmtClock(out, n, bootEpoch + (time_t)(ms / 1000));
+    else           snprintf(out, n, "%lu", (unsigned long)ms);
+}
+static time_t bootEpochNow() { return timeValid() ? time(nullptr) - (time_t)(millis() / 1000) : 0; }
+
 static const char* clsName(uint8_t cls) {
     switch (cls & 3) {
         case CLS_FROM_AP: return "AP";
@@ -413,18 +479,18 @@ static const char* clsName(uint8_t cls) {
     }
 }
 
-static void dumpEvidenceBuf(const char* head, const Evidence* log, uint8_t head_, uint8_t count) {
-    char sa[18], da[18];
+static void dumpEvidenceBuf(const char* head, const Evidence* log, uint8_t head_, uint8_t count, time_t bootEpoch) {
+    char sa[18], da[18], ts[16];
     Serial.printf("%s (%u Einträge, drop %lu):\n", head, count, (unsigned long)dringDrops.load());
     for (uint8_t i = 0; i < count; i++) {
         const Evidence& e = log[(head_ + EVIDENCE_SIZE - count + i) % EVIDENCE_SIZE];
-        macToStr(e.sa, sa); macToStr(e.da, da);
-        Serial.printf("  [%lu] %s ch%u SA=%s DA=%s reason=%u %ddBm %s\n", (unsigned long)e.ms,
+        macToStr(e.sa, sa); macToStr(e.da, da); fmtStamp(ts, sizeof ts, e.ms, bootEpoch);
+        Serial.printf("  [%s] %s ch%u SA=%s DA=%s reason=%u %ddBm %s\n", ts,
                       (e.cls & 0x80) ? "Disassoc" : "Deauth", e.ch, sa, da, e.reason, e.rssi, clsName(e.cls));
     }
 }
 
-static void dumpEvidence(const char* head) { dumpEvidenceBuf(head, evLog, evHead, evCount); }
+static void dumpEvidence(const char* head) { dumpEvidenceBuf(head, evLog, evHead, evCount, bootEpochNow()); }
 
 #if EVIDENCE_NVS
 static void saveEvidence(const char* reason, const char* detail) {
@@ -435,6 +501,7 @@ static void saveEvidence(const char* reason, const char* detail) {
     prefs.putString("evr", reason);
     prefs.putString("evd", detail);
     prefs.putUInt("evu", millis() / 1000);
+    prefs.putUInt("evb", (uint32_t)bootEpochNow());
     evDirty = false;
 }
 
@@ -449,7 +516,7 @@ static void printSavedEvidence() {
     if (prefs.getBytesLength("ev") == sizeof evLog) {
         static Evidence saved[EVIDENCE_SIZE];
         prefs.getBytes("ev", saved, sizeof saved);
-        dumpEvidenceBuf("Beweis-Log (NVS)", saved, prefs.getUChar("evh"), prefs.getUChar("evn"));
+        dumpEvidenceBuf("Beweis-Log (NVS)", saved, prefs.getUChar("evh"), prefs.getUChar("evn"), (time_t)prefs.getUInt("evb", 0));
     }
 }
 #else
@@ -503,11 +570,15 @@ static void raiseAlarm(const char* reason, const char* detail) {
     const bool episode = fresh || now - alarmLastCond > ALARM_HOLD_MS;
     alarmLatched = true;
     alarmLastCond = now;
-    if (fresh) alarmSince = now;
+    if (fresh) { alarmSince = now; alarmSinceT = timeValid() ? time(nullptr) : 0; }
+    if (timeValid()) alarmLastT = time(nullptr);
     if (episode) alarmCount++;
     strlcpy(alarmReason, reason, sizeof alarmReason);
     strlcpy(alarmDetail, detail, sizeof alarmDetail);
-    if (changed) Serial.printf("[%lu] ALARM #%lu %s | %s\n", (unsigned long)now, (unsigned long)alarmCount, reason, detail);
+    if (changed) {
+        Serial.printf("[%lu] ALARM #%lu %s | %s\n", (unsigned long)now, (unsigned long)alarmCount, reason, detail);
+        Serial.printf("EV ALARM|%s|%s\n", reason, detail);
+    }
     secureEvidence(reason, detail);
 #if NTFY_ENABLE
     if (fresh) ntfyPending = true;
@@ -517,7 +588,10 @@ static void raiseAlarm(const char* reason, const char* detail) {
 static void raiseWarn(const char* reason, const char* detail) {
     const uint32_t now = millis();
     if (now - warnLast > 5000 || strcmp(warnReason, reason) != 0)
+    {
         Serial.printf("[%lu] WARN  %s | %s\n", (unsigned long)now, reason, detail);
+        Serial.printf("EV WARN|%s|%s\n", reason, detail);
+    }
     warnLast = now;
     strlcpy(warnReason, reason, sizeof warnReason);
     strlcpy(warnDetail, detail, sizeof warnDetail);
@@ -795,6 +869,67 @@ static void printCalib() {
     if (n) Serial.printf(", Unicast-Mgmt vom AP %lu Frames, Mittel %ld dBm, zuletzt %d dBm\n",
                          (unsigned long)n, -(long)(uniRssiSum.load() / n), (int)uniRssiLast.load());
     else   Serial.println(", noch kein Unicast-Mgmt vom AP gesehen (Auth/Assoc/Action)");
+    if (WHITELIST_COUNT > 0 && fp[0].rssiValid)
+        Serial.printf("EV CALIB|%d|%lu|%ld\n", fp[0].rssiEma4 / 4, (unsigned long)n, n ? -(long)(uniRssiSum.load() / n) : 0L);
+}
+
+static void relearnFingerprints();
+
+// Client-Ereignisse ausgeben. Auth/Assoc-Request nur seriell (Rauschen beim
+// Roaming), JOIN/LEAVE/KICK als EV-Zeile für die Bridge, pro MAC entprellt.
+static void processClients() {
+    static uint8_t  lastMac[6] = {0};
+    static uint8_t  lastKind = 0;
+    static uint32_t lastMs = 0;
+    char mac[18];
+    while (cringTail != cringHead) {
+        const ClientEvent c = cring[cringTail];
+        cringTail = (cringTail + 1) & (CRING_SIZE - 1);
+        macToStr(c.mac, mac);
+        const uint32_t now = millis();
+        const bool dup = (c.kind == lastKind && memcmp(c.mac, lastMac, 6) == 0 && now - lastMs < 5000);
+        memcpy(lastMac, c.mac, 6); lastKind = c.kind; lastMs = now;
+        if (dup) continue;
+        switch (c.kind) {
+            case CE_AUTH:      Serial.printf("[%lu] Auth %s %ddBm\n", (unsigned long)now, mac, c.rssi); break;
+            case CE_ASSOC_REQ: Serial.printf("[%lu] AssocReq %s %ddBm\n", (unsigned long)now, mac, c.rssi); break;
+            case CE_JOIN:      Serial.printf("[%lu] JOIN %s %ddBm\nEV JOIN|%s|%d\n", (unsigned long)now, mac, c.rssi, mac, c.rssi); break;
+            case CE_JOIN_FAIL: Serial.printf("[%lu] Assoc abgelehnt %s status=%u\nEV JOINFAIL|%s|%u\n", (unsigned long)now, mac, c.code, mac, c.code); break;
+            case CE_LEAVE:     Serial.printf("[%lu] LEAVE %s reason=%u\nEV LEAVE|%s|%u\n", (unsigned long)now, mac, c.code, mac, c.code); break;
+            case CE_KICK:      Serial.printf("[%lu] KICK %s reason=%u %ddBm\nEV KICK|%s|%u|%d\n", (unsigned long)now, mac, c.code, c.rssi, mac, c.code, c.rssi); break;
+            default: break;
+        }
+    }
+}
+
+// Serial-Kommandos. Einzelzeichen sofort (d, r, h), "T<unix>\n" zeilenweise.
+static void pollSerial() {
+    static char buf[24];
+    static uint8_t n = 0;
+    while (Serial.available()) {
+        const char c = (char)Serial.read();
+        if (n == 0 && (c == 'd' || c == 'r' || c == 'h' || c == '?')) {
+            if (c == 'd')      { printSavedEvidence(); dumpEvidence("Beweis-Log (RAM)"); printCalib(); }
+            else if (c == 'r') relearnFingerprints();
+            else Serial.println("d = Beweis-Log, r = Fingerprints neu lernen, T<unix> = Zeit setzen");
+            continue;
+        }
+        if (c == '\n' || c == '\r') {
+            buf[n] = 0;
+            if (n > 1 && buf[0] == 'T') {
+                const time_t t = (time_t)strtoul(buf + 1, nullptr, 10);
+                if (t > 1700000000) {
+                    struct timeval tv = { .tv_sec = t, .tv_usec = 0 };
+                    settimeofday(&tv, nullptr);
+                    char ts[16]; fmtClock(ts, sizeof ts, t);
+                    Serial.printf("Zeit gesetzt: %s\nEV TIME|%lu\n", ts, (unsigned long)t);
+                } else Serial.println("T: ungültig");
+            }
+            n = 0;
+            continue;
+        }
+        if (n < sizeof buf - 1) buf[n++] = c; else n = 0;
+    }
 }
 
 // Gelernte Fingerprints verwerfen (nach Router-Update oder Konfigänderung)
@@ -819,7 +954,7 @@ static void pollButton() {
         stable = raw;
         if (!stable) {                       // Flanke: gedrückt
             pressedAt = now; longDone = false;
-            if (alarmLatched) Serial.println("ALARM quittiert");
+            if (alarmLatched) { Serial.println("ALARM quittiert"); Serial.println("EV ACK"); }
             alarmLatched = false;
             warnLast = 0;
             dispDeauthRate = dispDeauthMine = 0;
@@ -940,10 +1075,15 @@ static void draw(Level lvl, bool blinkOn) {
     g.setFont(&DejaVuL1_13);
     g.setTextDatum(textdatum_t::top_right);
     char up[24]; fmtUptime(up, sizeof up);
+    if (timeValid()) fmtClock(up, sizeof up, time(nullptr));
     snprintf(line, sizeof line, "%s%s", ntfyPending ? "ntfy  " : "", up);
     g.drawString(line, W - 6, 6);
-    if (alarmCount) snprintf(line, sizeof line, "drop %lu  #%lu", (unsigned long)ringDrops.load(), (unsigned long)alarmCount);
-    else            snprintf(line, sizeof line, "drop %lu", (unsigned long)ringDrops.load());
+    if (lvl == LVL_ALARM && alarmSinceT) {
+        char a[8], b[8];
+        fmtClockShort(a, sizeof a, alarmSinceT); fmtClockShort(b, sizeof b, alarmLastT);
+        snprintf(line, sizeof line, "%s-%s  #%lu", a, b, (unsigned long)alarmCount);
+    } else if (alarmCount) snprintf(line, sizeof line, "drop %lu  #%lu", (unsigned long)ringDrops.load(), (unsigned long)alarmCount);
+    else                   snprintf(line, sizeof line, "drop %lu", (unsigned long)ringDrops.load());
     g.drawString(line, W - 6, 24);
 
     // Grund (Font4, 26 px) + Detail (Font2)
@@ -1121,7 +1261,10 @@ void setup() {
     esp_wifi_set_ps(WIFI_PS_NONE);
 
     startSniffer();
+    setenv("TZ", TIMEZONE, 1);
+    tzset();
     Serial.printf("Sniffer aktiv. SSID=\"%s\" Whitelist=%u\n", TARGET_SSID, (unsigned)WHITELIST_COUNT);
+    Serial.println("EV BOOT");
 }
 
 void loop() {
@@ -1150,11 +1293,11 @@ void loop() {
         ieDumpReady = false;
     }
     pollButton();
-    while (Serial.available()) {
-        const char c = (char)Serial.read();
-        if (c == 'd')      { printSavedEvidence(); dumpEvidence("Beweis-Log (RAM)"); printCalib(); }
-        else if (c == 'r') relearnFingerprints();
-        else if (c == 'h' || c == '?') Serial.println("d = Beweis-Log, r = Fingerprints neu lernen");
+    pollSerial();
+    processClients();
+    {
+        static uint32_t lastCalib = 0;
+        if (millis() - lastCalib > 60000) { lastCalib = millis(); printCalib(); }
     }
 
     const uint32_t now = millis();

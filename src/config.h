@@ -103,6 +103,12 @@ static const ApEntry WHITELIST[] = {
 #define BUTTON_LONG_MS       3000   // BOOT so lange halten: Fingerprints (IE-Hash, TSF) neu lernen
 
 // =====================================================================
+// Uhrzeit: kommt per Serial ("T<unix>\n", z. B. von tools/pi-bridge), kein
+// NTP, keine WLAN-Verbindung. Ohne gesetzte Zeit zeigt das Display Uptime.
+// =====================================================================
+#define TIMEZONE             "CET-1CEST,M3.5.0,M10.5.0/3"   // POSIX-TZ, Deutschland
+
+// =====================================================================
 // Pins (Waveshare ESP32-C6-LCD-1.47)
 // =====================================================================
 #define PIN_LCD_MOSI         6

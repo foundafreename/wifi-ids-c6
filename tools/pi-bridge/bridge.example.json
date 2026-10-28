@@ -1,0 +1,21 @@
+{
+  "port": "/dev/ttyACM0",
+  "baud": 115200,
+  "sync_interval_s": 3600,
+  "log_keep_days": 30,
+  "notify": {
+    "backend": "signal",
+    "events": ["ALARM", "WARN", "NEWDEVICE", "LEAVE", "KICK"],
+    "warn_min_interval_s": 600,
+    "leave_min_interval_s": 300,
+    "signal": { "cli": "signal-cli", "account": "+4915112345678", "to": ["+4915112345678"] },
+    "ntfy": { "url": "https://ntfy.sh/mein-topic", "token": "" },
+    "telegram": { "bot_token": "", "chat_id": "" }
+  },
+  "fritzbox": {
+    "enabled": false,
+    "address": "192.168.178.1",
+    "user": "",
+    "password": ""
+  }
+}

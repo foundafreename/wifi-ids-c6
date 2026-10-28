@@ -1,0 +1,15 @@
+[Unit]
+Description=wifi-ids-c6 serial bridge (time sync, log, push)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/opt/wifi-ids-bridge
+ExecStart=/usr/bin/python3 /opt/wifi-ids-bridge/wifi_ids_bridge.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

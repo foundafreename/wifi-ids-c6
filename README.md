@@ -45,6 +45,8 @@ PlatformIO with pioarduino (Arduino core 3.x). `platformio.ini` pulls everything
 1. Edit `src/config.h`: `TARGET_SSID`, `WHITELIST[]` (BSSID plus channel, 0 means auto channel)
 2. `pio run -t upload && pio device monitor`
 
+Serial goes over the USB-C port (USB-Serial-JTAG), `platformio.ini` sets `ARDUINO_USB_CDC_ON_BOOT=1` for that. Without it everything is printed to UART0 and you see nothing.
+
 Don't know your BSSID? Leave the whitelist empty, flash, and read it off the serial log (`SSID-Match: <BSSID> chN ...`). On a FritzBox it's also under WLAN, Funkkanal, bottom table.
 
 Mesh repeaters broadcasting the same SSID have to go into the whitelist too, or you'll get a permanent evil-twin alarm.
@@ -65,7 +67,10 @@ Mesh repeaters broadcasting the same SSID have to go into the whitelist too, or 
 - Everything here is passive. There is no "connect to the suspicious AP and check the WAN IP" test on purpose: joining a twin with your real PSK hands the attacker a handshake to crack offline, and a bridged twin shows your real WAN IP anyway. The TSF and IE checks give you a second factor without sending a byte.
 - The RSSI rule can be fooled by an attacker standing next to your router. That is a different problem.
 - WPA3/PMF makes deauth attacks useless, but they still show up. In WPA2+WPA3 mixed mode the WPA2 clients can still be kicked.
-- ntfy (`NTFY_ENABLE 1`): on ALARM it briefly joins the Wi-Fi, posts, and goes back to sniffing. Blind for 5 to 15 s. If the AP is under attack right then, the connect will fail, as you'd expect.
+- Wall clock: the board has no NTP and never joins the Wi-Fi. It takes the time over USB serial (`T<unix>\n`), see `tools/pi-bridge`. With the time set, the display shows the clock, an alarm shows first and last occurrence, and the evidence log carries real timestamps. Without it you get uptime.
+- Serial commands: `d` dumps the evidence log (NVS and RAM) plus the RSSI calibration, `r` relearns the fingerprints, `T<unix>` sets the time. Lines starting with `EV ` are machine readable (ALARM, WARN, JOIN, LEAVE, KICK, BOOT, ACK, TIME, CALIB) for the bridge.
+- Push notifications: run `tools/pi-bridge` on a Pi with the board on USB. It pushes alarms, warnings, new devices and devices leaving via signal-cli, ntfy or Telegram, and keeps a device list. The board itself holds no credentials.
+- The built-in ntfy (`NTFY_ENABLE 1`) still exists but needs the Wi-Fi password in the firmware and goes blind for 5 to 15 s per push. The bridge is the better way.
 - Partition table is `huge_app` (3 MB app, no OTA) so ntfy with TLS still fits.
 
 ## Hardware
@@ -119,6 +124,8 @@ PlatformIO mit pioarduino (Arduino-Core 3.x). `platformio.ini` zieht alles selbs
 1. `src/config.h`: `TARGET_SSID`, `WHITELIST[]` (BSSID und Kanal, 0 = Autokanal)
 2. `pio run -t upload && pio device monitor`
 
+Serial läuft über die USB-C-Buchse (USB-Serial-JTAG), dafür setzt `platformio.ini` `ARDUINO_USB_CDC_ON_BOOT=1`. Ohne das landet alles auf UART0 und man sieht nichts.
+
 BSSID nicht zur Hand? Whitelist leer lassen, flashen, im Serial-Log steht `SSID-Match: <BSSID> chN ...`. Bei der FritzBox auch unter WLAN, Funkkanal, ganz unten in der Tabelle.
 
 Mesh-Repeater mit gleicher SSID müssen mit in die Whitelist, sonst Dauer-Twin-Alarm.
@@ -139,7 +146,10 @@ Mesh-Repeater mit gleicher SSID müssen mit in die Whitelist, sonst Dauer-Twin-A
 - Alles hier ist passiv. Einen "mit dem verdächtigen AP verbinden und WAN-IP prüfen"-Test gibt es absichtlich nicht: Wer sich mit dem echten PSK bei einem Twin einbucht, schenkt dem Angreifer einen Handshake zum Offline-Cracken, und ein gebridgter Twin zeigt sowieso die echte WAN-IP. TSF und IE-Hash sind der zweite Faktor, ohne ein Byte zu senden.
 - Die RSSI-Regel lässt sich von einem Angreifer direkt neben dem Router austricksen. Das ist dann ein anderes Problem.
 - WPA3/PMF macht Deauth-Angriffe wirkungslos, sichtbar sind sie trotzdem. Bei WPA2+WPA3-Mischbetrieb sind die WPA2-Clients weiterhin kickbar.
-- ntfy (`NTFY_ENABLE 1`): bucht sich bei ALARM kurz ins WLAN ein, postet, geht zurück in den Sniff-Modus. 5 bis 15 s blind. Läuft der AP gerade unter Beschuss, scheitert das erwartbar.
+- Uhrzeit: Das Board hat kein NTP und geht nie ins WLAN. Die Zeit kommt über USB-Serial (`T<unix>\n`), siehe `tools/pi-bridge`. Mit gesetzter Zeit zeigt das Display die Uhr, ein Alarm erstes und letztes Auftreten, und das Beweis-Log echte Zeitstempel. Ohne Zeit gibt es Uptime.
+- Serial-Kommandos: `d` gibt das Beweis-Log (NVS und RAM) plus die RSSI-Kalibrierung aus, `r` lernt die Fingerprints neu, `T<unix>` setzt die Zeit. Zeilen mit `EV ` am Anfang sind maschinenlesbar (ALARM, WARN, JOIN, LEAVE, KICK, BOOT, ACK, TIME, CALIB) für die Bridge.
+- Push: `tools/pi-bridge` auf einem Pi laufen lassen, an dem das Board per USB hängt. Pusht Alarme, Warnungen, neue Geräte und Abmeldungen per signal-cli, ntfy oder Telegram und führt eine Geräteliste. Das Board selbst kennt keine Zugangsdaten.
+- Das eingebaute ntfy (`NTFY_ENABLE 1`) gibt es noch, braucht aber das WLAN-Passwort in der Firmware und ist pro Push 5 bis 15 s blind. Die Bridge ist der bessere Weg.
 - Partitionstabelle `huge_app` (3 MB App, kein OTA), damit ntfy mit TLS noch reinpasst.
 
 ## Hardware
