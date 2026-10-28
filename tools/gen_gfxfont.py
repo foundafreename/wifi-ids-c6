@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Adafruit/LovyanGFX-GFXfont-Generator mit Latin-1 (0x20..0xFF) aus einer TTF.
-Aufruf: gen_gfxfont.py <ttf> <pixelhoehe> <name> <out.h>
-Format identisch zu Adafruit fontconvert (1-bit, MSB-first, zeilenweise gepackt)."""
+Aufruf: gen_gfxfont.py <ttf> <pixelhoehe> <name> <out.h> [first_hex last_hex]
+Format identisch zu Adafruit fontconvert (1-bit, MSB-first, zeilenweise gepackt).
+Optionaler Bereich, z. B. 2C 3A fuer eine reine Ziffern-/Uhrzeit-Schrift."""
 import sys, freetype
 
 ttf, px, name, out = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
 FIRST, LAST = 0x20, 0xFF
+if len(sys.argv) >= 7:
+    FIRST, LAST = int(sys.argv[5], 16), int(sys.argv[6], 16)
 face = freetype.Face(ttf)
 face.set_pixel_sizes(0, px)
 

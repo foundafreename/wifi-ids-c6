@@ -23,6 +23,8 @@ Deutsche Version weiter unten.
 
 Thresholds are in `src/config.h`.
 
+BOOT button: one click acknowledges an alarm, double click rotates the display, holding it for 3 s relearns the fingerprints.
+
 Every deauth against your BSSID goes into an evidence log (sender, receiver, reason code, RSSI, channel). On ALARM the log is printed to serial and written to NVS, and printed again after the next boot. So a reset no longer eats the evidence.
 
 Rule 6 and the RSSI part of 1b assume the board sits close to the router, so your AP's own frames are clearly louder than anything from outside. On a desk next to the FritzBox you see about -25 dBm; a spoofed frame from the neighbour's flat arrives 20 dB weaker.
@@ -58,7 +60,7 @@ Mesh repeaters broadcasting the same SSID have to go into the whitelist too, or 
 - IE hash: FNV-1a over the identity IEs only (SSID, rates, DS, country, HT and HE capabilities, RSN, extended capabilities, vendor IEs by OUI and type). Everything that moves in normal operation stays out: TIM, ERP protection bit, BSS load, HT/HE operation, CSA, BSS color, capability bits. First attempt hashed everything except a short blacklist and fired after two minutes. If it still fires, the serial log prints the IE list of the next beacon so you can see what changed.
 - Channel hopping is park-and-sweep: 20 s on the home channel, then 13 x 150 ms across the rest. Deauth rates are computed per channel against airtime, not wall clock, otherwise hopping would dilute a flood by a factor of 13. The trade-off table is in `config.h`.
 - The sender's channel comes from the DS Parameter IE, not from `rx_ctrl.channel` (adjacent-channel bleed).
-- Display is 320x172 landscape via LovyanGFX, framebuffer as a sprite. Fonts are custom GFX fonts with Latin-1 (`tools/gen_gfxfont.py`), the bundled ones can't do umlauts.
+- Display 320x172 via LovyanGFX, framebuffer as a sprite, 20 fps. Black ground, a status pill, the deauth rate as a ring against the alarm threshold, a translucent card with reason and detail, the explanation wrapped underneath, 13 channel dots at the bottom (home channel in the state colour, the scan cursor hops along). In the OK state the right half is a clock. Portrait works too: double-click BOOT rotates by 90 degrees, the setting survives a reboot. Fonts are Fira Sans as GFX fonts with Latin-1 (`tools/gen_gfxfont.py`), the bundled ones can't do umlauts.
 - LED: one envelope for every state, full on then a ramp down, the rest of the period dark. Green every 2 s is OK, amber every 0.8 s is WARN, red every 0.3 s is ALARM. Runs on an esp_timer at 250 Hz with 16 bit math and temporal dithering, so the tail of the ramp doesn't step. The board wants RGB instead of GRB, hence `LED_SWAP_RG`.
 
 ## Things to know
@@ -102,6 +104,8 @@ Gebaut für eine FritzBox, läuft aber mit jedem AP. Nur SSID und BSSID eintrage
 
 Schwellen in `src/config.h`.
 
+BOOT-Taster: einmal drücken quittiert einen Alarm, Doppelklick dreht das Display, 3 s halten lernt die Fingerprints neu.
+
 Jeder Deauth gegen die eigene BSSID landet in einem Beweis-Log (Sender, Empfänger, Reason-Code, RSSI, Kanal). Bei ALARM wird es seriell ausgegeben und in den NVS geschrieben, beim nächsten Boot noch einmal ausgegeben. Ein Reset frisst die Beweise damit nicht mehr.
 
 Regel 6 und der RSSI-Teil von 1b setzen voraus, dass das Board nah am Router steht, damit dessen eigene Frames deutlich lauter sind als alles von draußen. Neben der FritzBox sind das etwa -25 dBm, ein gespooftes Frame aus der Nachbarwohnung kommt 20 dB leiser an.
@@ -137,7 +141,7 @@ Mesh-Repeater mit gleicher SSID müssen mit in die Whitelist, sonst Dauer-Twin-A
 - IE-Hash: FNV-1a nur über die Identitäts-IEs (SSID, Raten, DS, Country, HT- und HE-Capabilities, RSN, Extended Capabilities, Vendor-IEs nach OUI und Typ). Alles, was sich im Betrieb bewegt, bleibt draußen: TIM, ERP-Protection-Bit, BSS Load, HT/HE Operation, CSA, BSS Color, Capability-Bits. Der erste Versuch hat alles bis auf eine kurze Blacklist gehasht und nach zwei Minuten Alarm geschlagen. Falls es trotzdem feuert, steht im Serial-Log die IE-Liste des nächsten Beacons, dann sieht man, was sich geändert hat.
 - Kanal-Hopping als Park-und-Sweep: 20 s auf dem Heimkanal, dann 13 x 150 ms über alle anderen. Deauth-Raten werden pro Kanal auf Airtime bezogen, nicht auf die Wanduhr, sonst würde das Hopping eine Flut um Faktor 13 verdünnen. Trade-off-Tabelle in `config.h`.
 - Der Kanal des Senders kommt aus der DS-Parameter-IE, nicht aus `rx_ctrl.channel` (Nachbarkanal-Bleed).
-- Display 320x172 quer über LovyanGFX, Framebuffer als Sprite. Fonts sind eigene GFXfonts mit Latin-1 (`tools/gen_gfxfont.py`), die mitgelieferten können kein ä.
+- Display 320x172 über LovyanGFX, Framebuffer als Sprite, 20 fps. Schwarzer Grund, Status-Pill, die Deauth-Rate als Ring gegen die Alarmschwelle, eine halbtransparente Karte mit Grund und Detail, die Erklärung darunter umgebrochen, unten 13 Kanalpunkte (Heimkanal in Zustandsfarbe, der Scan-Cursor hüpft entlang). Im OK-Zustand ist die rechte Hälfte eine Uhr. Hochkant geht auch: Doppelklick auf BOOT dreht um 90 Grad, die Einstellung überlebt den Neustart. Fonts sind Fira Sans als GFXfonts mit Latin-1 (`tools/gen_gfxfont.py`), die mitgelieferten können kein ä.
 - LED: eine Hüllkurve für alle Stufen, sofort an, dann Rampe runter, Rest der Periode dunkel. Grün alle 2 s ist OK, amber alle 0,8 s ist WARN, rot alle 0,3 s ist ALARM. Läuft im esp_timer mit 250 Hz, 16 Bit und zeitlichem Dithering, damit das Rampenende nicht stuft. Das Board will RGB statt GRB, deshalb `LED_SWAP_RG`.
 
 ## Was man wissen sollte

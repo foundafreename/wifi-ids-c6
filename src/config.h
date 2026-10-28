@@ -101,6 +101,7 @@ static const ApEntry WHITELIST[] = {
 #define WARN_HOLD_MS         15000
 #define BUTTON_DEBOUNCE_MS   40
 #define BUTTON_LONG_MS       3000   // BOOT so lange halten: Fingerprints (IE-Hash, TSF) neu lernen
+#define BUTTON_DOUBLE_MS     350    // zwei Klicks innerhalb dieser Zeit: Display um 90 Grad drehen
 
 // =====================================================================
 // Uhrzeit: kommt per Serial ("T<unix>\n", z. B. von tools/pi-bridge), kein
@@ -129,9 +130,8 @@ static const ApEntry WHITELIST[] = {
 #define LCD_OFFSET_Y         0
 #define LCD_SPI_HZ           40000000
 #define LCD_BRIGHTNESS       180    // 0..255
-#define LCD_ROTATION         1      // 1 = quer, USB links; 3 = quer, USB rechts
-#define BLINK_MS             400    // Display-Blinken bei ALARM
-#define REDRAW_MS            250
+#define LCD_ROTATION         1      // Startwert: 1/3 quer, 0/2 hochkant. Doppelklick BOOT dreht weiter, Stand liegt im NVS
+#define REDRAW_MS            50     // 20 fps, Ring und Alarm-Puls laufen mit der LED-Hüllkurve
 // LED-Muster: alle Stufen dieselbe Hüllkurve (sofort Max, Ramp-down, Rest dunkel),
 // nur Farbe und Tempo unterscheiden sich. Läuft im Timer, 16 Bit mit Dithering.
 #define LED_OK_MIN           4      // OK: Sockel, damit die LED nie ganz aus ist

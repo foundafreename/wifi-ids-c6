@@ -80,10 +80,16 @@
 #ifndef LED_TICK_MS
 #define LED_TICK_MS 4
 #endif
+#ifndef BUTTON_DOUBLE_MS
+#define BUTTON_DOUBLE_MS 350
+#endif
 #define IE_HASH_VERSION 2   // hochzählen, wenn sich ändert, was in den Hash eingeht
-#include "font_dejavu_13.h"   // Latin-1 (Umlaute), generiert mit tools/gen_gfxfont.py
-#include "font_dejavu_19.h"
-#include "font_dejavu_b30.h"
+#include "font_fira_r11.h"    // Fira Sans, Latin-1, generiert mit tools/gen_gfxfont.py
+#include "font_fira_r13.h"
+#include "font_fira_s12.h"
+#include "font_fira_s19.h"
+#include "font_fira_b24.h"
+#include "font_fira_b46.h"    // nur Ziffern und Satzzeichen, fuer die grosse Uhr
 
 #if NTFY_ENABLE
 #include <HTTPClient.h>
@@ -963,29 +969,48 @@ static void relearnFingerprints() {
     raiseWarn("FINGERPRINT NEU", "IE-Hash und TSF werden neu gelernt");
 }
 
+static void applyRotation(uint8_t rot);
+static uint8_t dispRotation = LCD_ROTATION;
+
+static void ackAlarm() {
+    if (alarmLatched) { Serial.println("ALARM quittiert"); Serial.println("EV ACK"); }
+    alarmLatched = false;
+    warnLast = 0;
+    dispDeauthRate = dispDeauthMine = 0;
+    dispDeauthCh = 0;
+    strlcpy(twinBssid, "-", sizeof twinBssid);
+    twinCh = 0;
+}
+
+// BOOT: 1x = quittieren (nach BUTTON_DOUBLE_MS ohne zweiten Druck),
+// 2x = Display um 90 Grad drehen, halten = Fingerprints neu lernen
 static void pollButton() {
     static bool     stable = true, lastRaw = true;
-    static uint32_t lastChange = 0, pressedAt = 0;
+    static uint32_t lastChange = 0, pressedAt = 0, releasedAt = 0;
     static bool     longDone = false;
+    static uint8_t  clicks = 0;
     const bool raw = digitalRead(PIN_BUTTON);
     const uint32_t now = millis();
     if (raw != lastRaw) { lastRaw = raw; lastChange = now; }
     if (now - lastChange > BUTTON_DEBOUNCE_MS && raw != stable) {
         stable = raw;
-        if (!stable) {                       // Flanke: gedrückt
-            pressedAt = now; longDone = false;
-            if (alarmLatched) { Serial.println("ALARM quittiert"); Serial.println("EV ACK"); }
-            alarmLatched = false;
-            warnLast = 0;
-            dispDeauthRate = dispDeauthMine = 0;
-            dispDeauthCh = 0;
-            strlcpy(twinBssid, "-", sizeof twinBssid);
-            twinCh = 0;
+        if (!stable) { pressedAt = now; longDone = false; }
+        else if (!longDone) {
+            releasedAt = now;
+            clicks++;
+            if (clicks >= 2) {
+                clicks = 0;
+                applyRotation((dispRotation + 1) & 3);
+            }
         }
     }
     if (!stable && !longDone && now - pressedAt >= BUTTON_LONG_MS) {   // lang gehalten
-        longDone = true;
+        longDone = true; clicks = 0;
         relearnFingerprints();
+    }
+    if (clicks == 1 && stable && now - releasedAt > BUTTON_DOUBLE_MS) {  // Einzelklick steht fest
+        clicks = 0;
+        ackAlarm();
     }
 }
 
@@ -1069,118 +1094,238 @@ static void fmtUptime(char* out, size_t n) {
     else   snprintf(out, n, "%02lu:%02lu:%02lu", (unsigned long)h, (unsigned long)m, (unsigned long)s);
 }
 
-// Zwei Zeilen Klartext je Alarm-/Warngrund, max. 42 Zeichen pro Zeile (DejaVu 13 auf 308 px)
-static void explain(const char* reason, const char*& l1, const char*& l2) {
-    struct Ex { const char* key; const char* a; const char* b; };
+// Ein Satz Klartext je Alarm-/Warngrund, wird je nach Breite umgebrochen
+static const char* explain(const char* reason) {
+    struct Ex { const char* key; const char* text; };
     static const Ex tab[] = {
-        { "DEAUTH eig. BSSID",   "Jemand wirft Geräte aus deinem WLAN.",      "Wer: siehe Serial. WPA3-Geräte sind immun." },
-        { "DEAUTH gespooft",     "Deauths mit deiner BSSID, aber falscher",    "Signalstärke: nicht vom Router. Angriff." },
-        { "DEAUTH-Flut",         "Deauth-Flut gegen ein fremdes Netz.",       "Nicht dein WLAN, aber jemand in Reichweite." },
-        { "DEAUTH vom AP",       "Dein Router selbst trennt Geräte.",         "Meist ein Gerät in der Reconnect-Schleife." },
-        { "EVIL TWIN",           "Fremder AP sendet deine SSID.",             "Nicht verbinden, Passwort nirgends eingeben." },
-        { "BSSID GEKLONT (IE)",  "Beacon mit deiner BSSID, anderer Aufbau.",  "Zweiter Sender oder Router-Update. BOOT 3 s." },
-        { "BSSID GEKLONT (TSF)", "Zwei Uhren hinter deiner BSSID.",           "Ein zweites Gerät imitiert deinen Router." },
-        { "BSSID ohne RSN",      "Dein Router sendet ohne Verschlüsselung.",  "Router-Einstellungen prüfen." },
-        { "SSID offen",          "Deine SSID wird unverschlüsselt gesendet.", "Fremder AP oder Router falsch konfiguriert." },
-        { "KANAL abweichend",    "Router auf anderem Kanal als erwartet.",    "Autokanal oder Einstellung geändert." },
-        { "AP STILL",            "Kein Beacon vom Router.",                   "Router aus, Kanal gewechselt oder gestört." },
-        { "TSF-Sprung",          "Die Uhr deines Routers ist gesprungen.",    "Einmal: Neustart. Mehrfach: Klon." },
-        { "FINGERPRINT NEU",     "Fingerprints gelöscht.",                    "Werden beim nächsten Beacon neu gelernt." },
+        { "DEAUTH eig. BSSID",   "Jemand wirft Geräte aus deinem WLAN. Wer: siehe Serial. WPA3-Geräte sind immun." },
+        { "DEAUTH gespooft",     "Deauths mit deiner BSSID, aber falscher Signalstärke. Nicht vom Router: Angriff." },
+        { "DEAUTH-Flut",         "Deauth-Flut gegen ein fremdes Netz. Nicht dein WLAN, aber jemand in Reichweite." },
+        { "DEAUTH vom AP",       "Dein Router selbst trennt Geräte. Meist ein Gerät in der Reconnect-Schleife." },
+        { "EVIL TWIN",           "Fremder AP sendet deine SSID. Nicht verbinden, Passwort nirgends eingeben." },
+        { "BSSID GEKLONT (IE)",  "Beacon mit deiner BSSID, anderer Aufbau. Zweiter Sender oder Router-Update. BOOT 3 s." },
+        { "BSSID GEKLONT (TSF)", "Zwei Uhren hinter deiner BSSID. Ein zweites Gerät imitiert deinen Router." },
+        { "BSSID ohne RSN",      "Dein Router sendet ohne Verschlüsselung. Router-Einstellungen prüfen." },
+        { "SSID offen",          "Deine SSID wird unverschlüsselt gesendet. Fremder AP oder Router falsch konfiguriert." },
+        { "KANAL abweichend",    "Router auf anderem Kanal als erwartet. Autokanal oder Einstellung geändert." },
+        { "AP STILL",            "Kein Beacon vom Router. Router aus, Kanal gewechselt oder gestört." },
+        { "TSF-Sprung",          "Die Uhr deines Routers ist gesprungen. Einmal: Neustart. Mehrfach: Klon." },
+        { "FINGERPRINT NEU",     "Fingerprints gelöscht. Werden beim nächsten Beacon neu gelernt." },
     };
-    l1 = l2 = nullptr;
-    for (const Ex& e : tab)
-        if (strcmp(e.key, reason) == 0) { l1 = e.a; l2 = e.b; return; }
+    for (const Ex& e : tab) if (strcmp(e.key, reason) == 0) return e.text;
+    return "";
 }
 
-static void draw(Level lvl, bool blinkOn) {
+// ---------------------------------------------------------------------
+// Renderer. Farben und Formen nach dem Entwurf: Ground schwarz, Glaskarte,
+// Ring als Pegel, Status-Pill, Kanalpunkte. Beide Orientierungen.
+// ---------------------------------------------------------------------
+static constexpr uint32_t C_GROUND = 0x000000, C_TRACK = 0x2a2a32, C_TXT1 = 0xf2f2f5,
+                          C_TXT2 = 0xc8c8d0, C_TXT3 = 0x9a9aa6, C_TXT4 = 0x6e6e7a,
+                          C_OK = 0x30d158, C_WARN = 0xffb340, C_ALARM = 0xff453a;
+
+static uint32_t stateColor(Level lvl) { return lvl == LVL_ALARM ? C_ALARM : lvl == LVL_WARN ? C_WARN : C_OK; }
+
+// Hüllkurve der LED für das Display (gleiche Phase, gleiche Form)
+static float envelope(Level lvl) {
+    const LedPattern& pat = LED_PAT[lvl];
+    const uint32_t t = (uint32_t)(esp_timer_get_time() / 1000) % pat.periodMs;
+    if (t >= pat.rampMs) return 0.0f;
+    const float x = 1.0f - (float)t / pat.rampMs;
+    return powf(x, LED_GAMMA);
+}
+
+// Superellipse n=4 (Squircle), gefuellt, mit Alpha ueber dem Ground
+static void fillSquircle(LovyanGFX& g, int x, int y, int w, int h, int r, uint8_t alpha, uint32_t color) {
+    if (r * 2 > h) r = h / 2;
+    if (r * 2 > w) r = w / 2;
+    for (int row = 0; row < h; row++) {
+        int inset = 0;
+        const int dy = (row < r) ? (r - row) : (row >= h - r) ? (row - (h - r) + 1) : 0;
+        if (dy > 0) {
+            const float t = (float)dy / r;                 // 0..1
+            const float f = powf(1.0f - powf(t, 4.0f), 0.25f);
+            inset = r - (int)(f * r + 0.5f);
+        }
+        g.fillRectAlpha(x + inset, y + row, w - 2 * inset, 1, alpha, color);
+    }
+    g.fillRectAlpha(x + r, y, w - 2 * r, 1, 30, 0xffffff);   // Highlight oben
+}
+
+static void pill(LovyanGFX& g, int x, int y, int h, const char* text, uint32_t accent, uint8_t tintAlpha, float dot) {
+    g.setFont(&FiraS12);
+    const int tw = g.textWidth(text);
+    const int w = 5 + 8 + 5 + tw + 8;
+    g.fillRectAlpha(x, y, w, h, tintAlpha, accent);
+    g.fillSmoothCircle(x + 5 + 4, y + h / 2, 4, g.color888((uint8_t)(((accent >> 16) & 0xff) * dot), (uint8_t)(((accent >> 8) & 0xff) * dot), (uint8_t)((accent & 0xff) * dot)));
+    g.setTextDatum(textdatum_t::middle_left);
+    g.setTextColor(accent == C_OK ? C_TXT1 : accent);
+    g.drawString(text, x + 5 + 8 + 5, y + h / 2);
+}
+
+static void drawRing(LovyanGFX& g, int cx, int cy, int r, int sw, float frac, uint32_t accent, float bright) {
+    g.fillArc(cx, cy, r - sw, r, 0, 360, C_TRACK);
+    if (frac > 0.005f) {
+        const uint32_t c = g.color888((uint8_t)(((accent >> 16) & 0xff) * bright), (uint8_t)(((accent >> 8) & 0xff) * bright), (uint8_t)((accent & 0xff) * bright));
+        if (frac > 0.995f) g.fillArc(cx, cy, r - sw, r, 0, 360, c);
+        else               g.fillArc(cx, cy, r - sw, r, 270, 270 + frac * 360.0f, c);
+    }
+}
+
+// Woerter in Zeilen der Breite maxW umbrechen, hoechstens maxLines
+static int wrapText(LovyanGFX& g, const char* text, int maxW, char lines[][64], int maxLines) {
+    int n = 0; char cur[64] = ""; char word[48];
+    const char* p = text;
+    while (*p && n < maxLines) {
+        while (*p == ' ') p++;
+        int wl = 0; while (*p && *p != ' ' && wl < 47) word[wl++] = *p++;
+        word[wl] = 0;
+        if (!wl) break;
+        char test[64]; snprintf(test, sizeof test, "%s%s%s", cur, cur[0] ? " " : "", word);
+        if (g.textWidth(test) <= maxW || !cur[0]) strlcpy(cur, test, sizeof cur);
+        else { strlcpy(lines[n++], cur, 64); strlcpy(cur, word, sizeof cur); }
+    }
+    if (cur[0] && n < maxLines) strlcpy(lines[n++], cur, 64);
+    return n;
+}
+
+static void dots(LovyanGFX& g, int x0, int x1, int y, uint32_t accent) {
+    const float step = (float)(x1 - x0) / (CH_MAX - CH_MIN);
+    for (int c = CH_MIN; c <= CH_MAX; c++) {
+        const int x = x0 + (int)((c - CH_MIN) * step + 0.5f);
+        const bool home = ownBeaconSeen && c == lastOwnBeaconCh;
+        if (home)            g.fillSmoothCircle(x, y, 4, accent);
+        else if (c == curCh) g.fillSmoothCircle(x, y, 3, C_TXT1);
+        else                 g.fillSmoothCircle(x, y, 3, C_TRACK);
+    }
+}
+
+static const char* WDAY[7]  = { "Sonntag", "Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag" };
+static const char* MONTH[12] = { "Januar", "Februar", "März", "April", "Mai", "Juni", "Juli", "August", "September", "Oktober", "November", "Dezember" };
+
+static float ringShown = 0;   // geglaetteter Pegel
+
+static void draw(Level lvl) {
     LovyanGFX& g = fbOk ? static_cast<LovyanGFX&>(fb) : static_cast<LovyanGFX&>(lcd);
-    uint16_t bg, fg = TFT_WHITE;
-    const char* title;
-    const char* reason = "";
-    const char* detail = "";
-    switch (lvl) {
-        case LVL_OK:    bg = g.color565(0, 110, 30);  title = "OK";    break;
-        case LVL_WARN:  bg = g.color565(200, 150, 0); title = "WARN";  fg = TFT_BLACK; reason = warnReason; detail = warnDetail; break;
-        default:        bg = blinkOn ? g.color565(210, 0, 0) : g.color565(70, 0, 0); title = "ALARM"; reason = alarmReason; detail = alarmDetail; break;
-    }
-    // Querformat: 320 x 172
-    const int W = LCD_HEIGHT, H = LCD_WIDTH;
-    g.fillScreen(bg);
-    g.setTextColor(fg, bg);
-    char line[64];
+    const int W = g.width(), H = g.height();
+    const bool portrait = H > W;
+    const uint32_t accent = stateColor(lvl);
+    const float env = envelope(lvl);
+    const float bright = (lvl == LVL_ALARM) ? 0.35f + 0.65f * env : 1.0f;
+    const char* reason = lvl == LVL_ALARM ? alarmReason : lvl == LVL_WARN ? warnReason : "";
+    const char* detail = lvl == LVL_ALARM ? alarmDetail : lvl == LVL_WARN ? warnDetail : "";
 
-    // Kopfzeile: Titel links (Font4 x1.5 = 39 px), Uptime rechts
-    g.setFont(&DejaVuL1B_30);
-    g.setTextDatum(textdatum_t::top_left);
-    g.drawString(title, 6, 4);
-    g.setFont(&DejaVuL1_13);
-    g.setTextDatum(textdatum_t::top_right);
-    char up[24]; fmtUptime(up, sizeof up);
-    if (timeValid()) fmtClock(up, sizeof up, time(nullptr));
-    snprintf(line, sizeof line, "%s%s", ntfyPending ? "ntfy  " : "", up);
-    g.drawString(line, W - 6, 6);
-    if (lvl == LVL_ALARM && alarmSinceT) {
+    // Pegel: eigene Deauth-Rate relativ zur Alarmschwelle, geglaettet
+    const float target = (lvl == LVL_ALARM) ? 1.0f : fminf(dispDeauthMine / (float)DEAUTH_MINE_PER_S, 1.0f);
+    ringShown += (target - ringShown) * 0.25f;
+
+    g.fillScreen(C_GROUND);
+    char line[64], ts[16];
+
+    // Kopf: Pill links, Uhr rechts
+    const int m = portrait ? 6 : 8;
+    pill(g, m, 6, 20, lvl == LVL_ALARM ? "ALARM" : lvl == LVL_WARN ? "WARNUNG" : "AKTIV", accent,
+         lvl == LVL_ALARM ? 46 : lvl == LVL_WARN ? 36 : 15, lvl == LVL_ALARM ? bright : 1.0f);
+    const bool haveTime = timeValid();
+    if (haveTime) fmtClock(ts, sizeof ts, time(nullptr)); else fmtUptime(ts, sizeof ts);
+    g.setFont(&FiraR13);
+    g.setTextColor(C_TXT1);
+    g.setTextDatum(textdatum_t::middle_right);
+    g.drawString(ts, W - m, 16);
+    if (lvl != LVL_OK) {
         char a[8], b[8];
-        fmtClockShort(a, sizeof a, alarmSinceT); fmtClockShort(b, sizeof b, alarmLastT);
-        snprintf(line, sizeof line, "%s-%s  #%lu", a, b, (unsigned long)alarmCount);
-    } else if (alarmCount) snprintf(line, sizeof line, "drop %lu  #%lu", (unsigned long)ringDrops.load(), (unsigned long)alarmCount);
-    else                   snprintf(line, sizeof line, "drop %lu", (unsigned long)ringDrops.load());
-    g.drawString(line, W - 6, 24);
-
-    // Grund (Font4, 26 px) + Detail (Font2)
-    g.setTextDatum(textdatum_t::top_left);
-    g.setFont(&DejaVuL1_19);
-    g.drawString(reason[0] ? reason : "Netz unauffällig", 6, 48);
-    g.setFont(&DejaVuL1_13);
-    g.drawString(detail, 6, 78);
-
-    // Trennlinie
-    g.drawFastHLine(6, 98, W - 12, fg);
-
-    // Unterer Block (Font2, 3 Zeilen): bei OK drei Statuszeilen, bei WARN/ALARM
-    // zwei Zeilen Erklärung und eine komprimierte Statuszeile
-    const int lh = 18;
-    int y = 104;
-    const char* ex1 = nullptr; const char* ex2 = nullptr;
-    if (lvl != LVL_OK) explain(reason, ex1, ex2);
-
-    if (ex1) {
-        g.drawString(ex1, 6, y); y += lh;
-        g.drawString(ex2 ? ex2 : "", 6, y); y += lh;
-        if (ownBeaconSeen)
-            snprintf(line, sizeof line, "Deauth/s %.1f  Twin %s  ch%u, AP vor %lu s", dispDeauthMine,
-                     twinCh ? "ja" : "-", curCh, (unsigned long)((millis() - lastOwnBeaconMs) / 1000));
-        else
-            snprintf(line, sizeof line, "Deauth/s %.1f  Twin %s  ch%u, AP fehlt", dispDeauthMine,
-                     twinCh ? "ja" : "-", curCh);
-        g.drawString(line, 6, y);
-    } else {
-        snprintf(line, sizeof line, "Deauth/s %.1f (ch%u)   eigene %.1f", dispDeauthRate, dispDeauthCh, dispDeauthMine);
-        g.drawString(line, 6, y); y += lh;
-
-        if (twinCh) snprintf(line, sizeof line, "Twin %s  ch%u  %d dBm", twinBssid, twinCh, twinRssi);
-        else        snprintf(line, sizeof line, "Twin %s", twinBssid);
-        g.drawString(line, 6, y); y += lh;
-
-        if (ownBeaconSeen)
-            snprintf(line, sizeof line, "Scan ch%u   AP ch%u, vor %lu s", curCh, lastOwnBeaconCh,
-                     (unsigned long)((millis() - lastOwnBeaconMs) / 1000));
-        else
-            snprintf(line, sizeof line, "Scan ch%u   AP nicht gesehen", curCh);
-        g.drawString(line, 6, y);
+        if (lvl == LVL_ALARM && alarmSinceT) { fmtClockShort(a, sizeof a, alarmSinceT); fmtClockShort(b, sizeof b, alarmLastT); snprintf(line, sizeof line, "%s bis %s · #%lu", a, b, (unsigned long)alarmCount); }
+        else if (lvl == LVL_ALARM)          snprintf(line, sizeof line, "seit %lu s · #%lu", (unsigned long)((millis() - alarmSince) / 1000), (unsigned long)alarmCount);
+        else                                snprintf(line, sizeof line, "vor %lu s", (unsigned long)((millis() - warnLast) / 1000));
+        g.setFont(&FiraR11);
+        g.setTextColor(C_TXT3);
+        g.setTextDatum(textdatum_t::middle_right);
+        g.drawString(line, W - m - (portrait ? 0 : g.textWidth(ts) + 8), portrait ? 30 : 16);
     }
 
-    // Kanalbalken unten: 13 Segmente, aktueller Kanal hell, Heimkanal markiert
-    {
-        const int bx = 6, by = H - 12, bw = (W - 12) / 13, bh = 8;
-        for (int c = CH_MIN; c <= CH_MAX; c++) {
-            const int x = bx + (c - CH_MIN) * bw;
-            const bool cur = (c == curCh), home = (c == lastOwnBeaconCh && ownBeaconSeen);
-            if (cur)       g.fillRect(x, by, bw - 2, bh, fg);
-            else if (home) g.drawRect(x, by, bw - 2, bh, fg);
-            else           g.drawFastHLine(x, by + bh - 1, bw - 2, fg);
+    // Ring
+    int rcx, rcy, rr;
+    if (!portrait) { rcx = 46; rcy = 78; rr = 36; }
+    else           { rcx = W / 2; rcy = lvl == LVL_OK ? 90 : 76; rr = lvl == LVL_OK ? 46 : 40; }
+    drawRing(g, rcx, rcy, rr, 7, lvl == LVL_OK ? ringShown : fmaxf(ringShown, 0.02f), accent, bright);
+    snprintf(line, sizeof line, lvl == LVL_ALARM && dispDeauthMine >= 10 ? "%.0f" : "%.1f", dispDeauthMine);
+    for (char* c = line; *c; c++) if (*c == '.') *c = ',';
+    g.setFont(&FiraB24);
+    g.setTextColor(C_TXT1);
+    g.setTextDatum(textdatum_t::middle_center);
+    g.drawString(line, rcx, rcy - 4);
+    g.setFont(&FiraR11);
+    g.setTextColor(C_TXT3);
+    g.drawString("Deauth/s", rcx, rcy + 14);
+
+    if (lvl == LVL_OK) {
+        // grosse Uhr und Datum
+        if (haveTime) {
+            const time_t t = time(nullptr); struct tm tmv; localtime_r(&t, &tmv);
+            strftime(ts, sizeof ts, "%H:%M", &tmv);
+            snprintf(line, sizeof line, "%s, %d. %s", WDAY[tmv.tm_wday], tmv.tm_mday, MONTH[tmv.tm_mon]);
+            g.setFont(&FiraB46);
+            g.setTextColor(C_TXT1);
+            if (!portrait) { g.setTextDatum(textdatum_t::middle_right);  g.drawString(ts, W - m, 76); }
+            else           { g.setTextDatum(textdatum_t::middle_center); g.drawString(ts, W / 2, 176); }
+            g.setFont(&FiraR11);
+            g.setTextColor(C_TXT3);
+            if (!portrait) g.drawString(line, W - m, 106); else g.drawString(line, W / 2, 206);
+        } else {
+            g.setFont(&FiraR13);
+            g.setTextColor(C_TXT3);
+            g.setTextDatum(portrait ? textdatum_t::middle_center : textdatum_t::middle_right);
+            g.drawString("keine Uhrzeit", portrait ? W / 2 : W - m, portrait ? 176 : 80);
+        }
+        // Infozeile(n)
+        char last[8] = "";
+        if (alarmLastT) fmtClockShort(last, sizeof last, alarmLastT);
+        g.setFont(&FiraR11);
+        g.setTextColor(C_TXT4);
+        if (!portrait) {
+            g.setTextDatum(textdatum_t::middle_left);
+            if (ownBeaconSeen) snprintf(line, sizeof line, "Netz unauffällig · AP ch%u vor %lu s%s%s", lastOwnBeaconCh, (unsigned long)((millis() - lastOwnBeaconMs) / 1000), last[0] ? " · letzter Alarm " : "", last);
+            else               snprintf(line, sizeof line, "Netz unauffällig · AP nicht gesehen");
+            g.drawString(line, m, 136);
+        } else {
+            g.setTextDatum(textdatum_t::middle_center);
+            g.drawString("Netz unauffällig", W / 2, 246);
+            if (ownBeaconSeen) snprintf(line, sizeof line, "AP ch%u vor %lu s", lastOwnBeaconCh, (unsigned long)((millis() - lastOwnBeaconMs) / 1000));
+            else               snprintf(line, sizeof line, "AP nicht gesehen");
+            g.drawString(line, W / 2, 262);
+            if (last[0]) { snprintf(line, sizeof line, "letzter Alarm %s", last); g.drawString(line, W / 2, 278); }
+        }
+    } else {
+        // Glaskarte
+        int cx, cy, cw, ch;
+        if (!portrait) { cx = 98; cy = 42; cw = W - 98 - m; ch = 80; }
+        else           { cx = m; cy = 126; cw = W - 2 * m; ch = 88; }
+        fillSquircle(g, cx, cy, cw, ch, 12, lvl == LVL_ALARM ? 40 : 26, accent);
+        g.setTextDatum(textdatum_t::middle_left);
+        g.setFont(&FiraS19);
+        g.setTextColor(C_TXT1);
+        g.drawString(reason, cx + 11, cy + 18);
+        g.setFont(&FiraR13);
+        g.setTextColor(C_TXT2);
+        g.drawString(detail, cx + 11, cy + 42);
+        g.setTextColor(C_TXT3);
+        if (twinCh) snprintf(line, sizeof line, "Twin ch%u %d dBm", twinCh, twinRssi);
+        else if (ownBeaconSeen) snprintf(line, sizeof line, "AP ch%u vor %lu s · Twin nein", lastOwnBeaconCh, (unsigned long)((millis() - lastOwnBeaconMs) / 1000));
+        else snprintf(line, sizeof line, "AP nicht gesehen");
+        g.drawString(line, cx + 11, cy + 62);
+        // Erklaerung, umgebrochen
+        char lines[4][64];
+        g.setFont(&FiraR13);
+        const int n = wrapText(g, explain(reason), W - 2 * m, lines, portrait ? 4 : 2);
+        int y = portrait ? 230 : 130;
+        for (int i = 0; i < n; i++) {
+            g.setTextColor(i == 0 ? C_TXT1 : C_TXT3);
+            g.drawString(lines[i], m, y);
+            y += 16;
         }
     }
+
+    dots(g, m + 4, W - m - 4, H - 10, accent);
     if (fbOk) fb.pushSprite(0, 0);
 }
 
@@ -1247,6 +1392,17 @@ static void sendNtfy() {
 #endif
 
 // ---------------------------------------------------------------------
+// Display drehen, Sprite neu anlegen (0/2 hochkant, 1/3 quer), in NVS merken
+static void applyRotation(uint8_t rot) {
+    dispRotation = rot & 3;
+    lcd.setRotation(dispRotation);
+    if (fbOk) fb.deleteSprite();
+    fbOk = fb.createSprite(lcd.width(), lcd.height()) != nullptr;   // 320x172x2 = 110 KB
+    if (!fbOk) Serial.println("Sprite-Alloc fehlgeschlagen, zeichne direkt");
+    prefs.putUChar("rot", dispRotation);
+    Serial.printf("Rotation %u (%ux%u)\n", dispRotation, lcd.width(), lcd.height());
+}
+
 void setup() {
     Serial.begin(115200);
 #if ARDUINO_USB_CDC_ON_BOOT
@@ -1257,17 +1413,15 @@ void setup() {
     targetSsidLen = strlen(TARGET_SSID);
 
     lcd.init();
-    lcd.setRotation(LCD_ROTATION);
     lcd.setBrightness(LCD_BRIGHTNESS);
     fb.setColorDepth(16);
-    fbOk = fb.createSprite(lcd.width(), lcd.height()) != nullptr;   // 320x172x2 = 110 KB
-    if (!fbOk) Serial.println("Sprite-Alloc fehlgeschlagen, zeichne direkt");
+    prefs.begin("ids", false);
+    applyRotation(prefs.getUChar("rot", LCD_ROTATION));
     lcd.fillScreen(TFT_BLACK);
     lcd.setTextColor(TFT_WHITE);
-    lcd.setFont(&DejaVuL1_13);
-    lcd.drawString("WLAN-IDS startet …", 4, 4);
+    lcd.setFont(&FiraR13);
+    lcd.drawString("WLAN-IDS startet", 6, 6);
 
-    prefs.begin("ids", false);
 #if CHECK_IE_HASH
     // Hash-Algorithmus geändert -> alte Werte wegwerfen, sonst Alarm beim ersten Beacon
     if (prefs.getUChar("iev", 0) != IE_HASH_VERSION) {
@@ -1311,8 +1465,6 @@ void setup() {
 
 void loop() {
     static uint32_t lastDraw = 0;
-    static bool blink = false;
-    static uint32_t lastBlink = 0;
 
     processDeauths();          // vor der Bewertung, damit die Klassen-Zähler stimmen
     hopChannel();
@@ -1343,12 +1495,11 @@ void loop() {
     }
 
     const uint32_t now = millis();
-    if (now - lastBlink >= BLINK_MS) { lastBlink = now; blink = !blink; }
 
     const Level lvl = currentLevel();
     if (now - lastDraw >= REDRAW_MS) {
         lastDraw = now;
-        draw(lvl, blink);
+        draw(lvl);
     }
     updateLed(lvl);
 
