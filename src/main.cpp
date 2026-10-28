@@ -399,16 +399,18 @@ static const char* clsName(uint8_t cls) {
     }
 }
 
-static void dumpEvidence(const char* head) {
+static void dumpEvidenceBuf(const char* head, const Evidence* log, uint8_t head_, uint8_t count) {
     char sa[18], da[18];
-    Serial.printf("%s (%u Einträge, drop %lu):\n", head, evCount, (unsigned long)dringDrops.load());
-    for (uint8_t i = 0; i < evCount; i++) {
-        const Evidence& e = evLog[(evHead + EVIDENCE_SIZE - evCount + i) % EVIDENCE_SIZE];
+    Serial.printf("%s (%u Einträge, drop %lu):\n", head, count, (unsigned long)dringDrops.load());
+    for (uint8_t i = 0; i < count; i++) {
+        const Evidence& e = log[(head_ + EVIDENCE_SIZE - count + i) % EVIDENCE_SIZE];
         macToStr(e.sa, sa); macToStr(e.da, da);
         Serial.printf("  [%lu] %s ch%u SA=%s DA=%s reason=%u %ddBm %s\n", (unsigned long)e.ms,
                       (e.cls & 0x80) ? "Disassoc" : "Deauth", e.ch, sa, da, e.reason, e.rssi, clsName(e.cls));
     }
 }
+
+static void dumpEvidence(const char* head) { dumpEvidenceBuf(head, evLog, evHead, evCount); }
 
 #if EVIDENCE_NVS
 static void saveEvidence(const char* reason, const char* detail) {
@@ -422,20 +424,24 @@ static void saveEvidence(const char* reason, const char* detail) {
     evDirty = false;
 }
 
+// Gesicherten Dump ausgeben, ohne das RAM-Log anzufassen. Beim Boot und auf
+// Serial-Kommando 'd', weil der USB-Port nach einem Reset erst neu enumeriert
+// und die Boot-Ausgabe am Host meist verloren geht.
 static void printSavedEvidence() {
-    if (!prefs.isKey("evr")) return;
-    Serial.printf("Letzter Alarm vor Reset: %s | %s (Uptime damals %lu s)\n",
+    if (!prefs.isKey("evr")) { Serial.println("NVS: kein gesicherter Alarm"); return; }
+    Serial.printf("Letzter gesicherter Alarm: %s | %s (Uptime damals %lu s)\n",
                   prefs.getString("evr").c_str(), prefs.getString("evd").c_str(),
                   (unsigned long)prefs.getUInt("evu"));
     if (prefs.getBytesLength("ev") == sizeof evLog) {
-        prefs.getBytes("ev", evLog, sizeof evLog);
-        evHead  = prefs.getUChar("evh");
-        evCount = prefs.getUChar("evn");
-        dumpEvidence("Beweis-Log davon");
-        evHead = evCount = 0;           // RAM-Log frisch starten
-        memset(evLog, 0, sizeof evLog);
+        static Evidence saved[EVIDENCE_SIZE];
+        prefs.getBytes("ev", saved, sizeof saved);
+        dumpEvidenceBuf("Beweis-Log (NVS)", saved, prefs.getUChar("evh"), prefs.getUChar("evn"));
     }
 }
+#else
+static void printSavedEvidence() {}
+#endif
+#if 0
 #endif
 
 static void pushEvidence(const DeauthEvent& d, uint8_t cls) {
@@ -478,10 +484,13 @@ static void raiseAlarm(const char* reason, const char* detail) {
     const uint32_t now = millis();
     const bool fresh = !alarmLatched;
     const bool changed = fresh || strcmp(alarmReason, reason) != 0;
+    // Zähler: Episoden, nicht Reason-Wechsel. Sonst zählt "eig. BSSID" / "gespooft"
+    // im Wechsel pro Frame hoch (1454 in einer Nacht).
+    const bool episode = fresh || now - alarmLastCond > ALARM_HOLD_MS;
     alarmLatched = true;
     alarmLastCond = now;
     if (fresh) alarmSince = now;
-    if (changed) alarmCount++;
+    if (episode) alarmCount++;
     strlcpy(alarmReason, reason, sizeof alarmReason);
     strlcpy(alarmDetail, detail, sizeof alarmDetail);
     if (changed) Serial.printf("[%lu] ALARM #%lu %s | %s\n", (unsigned long)now, (unsigned long)alarmCount, reason, detail);
@@ -1033,6 +1042,9 @@ static void sendNtfy() {
 // ---------------------------------------------------------------------
 void setup() {
     Serial.begin(115200);
+#if ARDUINO_USB_CDC_ON_BOOT
+    Serial.setTxTimeoutMs(10);     // ohne Host am USB nicht blockieren
+#endif
     delay(300);
     pinMode(PIN_BUTTON, INPUT_PULLUP);
     targetSsidLen = strlen(TARGET_SSID);
@@ -1112,6 +1124,12 @@ void loop() {
         ieDumpReady = false;
     }
     pollButton();
+    while (Serial.available()) {
+        const char c = (char)Serial.read();
+        if (c == 'd')      { printSavedEvidence(); dumpEvidence("Beweis-Log (RAM)"); }
+        else if (c == 'r') relearnFingerprints();
+        else if (c == 'h' || c == '?') Serial.println("d = Beweis-Log, r = Fingerprints neu lernen");
+    }
 
     const uint32_t now = millis();
     if (now - lastBlink >= BLINK_MS) { lastBlink = now; blink = !blink; }
