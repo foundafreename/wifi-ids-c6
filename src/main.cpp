@@ -167,6 +167,11 @@ static std::atomic<uint32_t> cntDeauthTotal{0};
 static std::atomic<uint32_t> cntDeauthMine{0};
 static std::atomic<uint32_t> cntMgmtTotal{0};
 
+// Regel-6-Kalibrierung: RSSI von Unicast-Management-Frames des eigenen AP
+static std::atomic<uint32_t> uniRssiSum{0};   // Summe der Beträge (RSSI ist negativ)
+static std::atomic<uint32_t> uniRssiN{0};
+static std::atomic<int8_t>   uniRssiLast{0};
+
 // Debug: nach IE-Alarm einmal die IE-Liste des nächsten eigenen Beacons
 // sichern (id, len, bei Vendor OUI+Typ), damit man sieht, was sich ändert.
 static volatile bool ieDumpWanted = false;
@@ -220,6 +225,15 @@ static void promiscCb(void* buf, wifi_promiscuous_pkt_type_t type) {
             d.subtype = subtype;
             dringHead = next;
         }
+        return;
+    }
+    // Kalibrierung für Regel 6: Unicast-Management vom eigenen AP (Auth 0x0B,
+    // Assoc Resp 0x01, Reassoc Resp 0x03, Action 0x0D) muss mit Beacon-RSSI
+    // ankommen. Tut es das nicht, ist die RSSI-Regel am Standort unbrauchbar.
+    if ((subtype == 0x0B || subtype == 0x01 || subtype == 0x03 || subtype == 0x0D) && whitelistIndex(a2) >= 0) {
+        uniRssiSum.fetch_add((uint32_t)(int32_t)(-pkt->rx_ctrl.rssi), std::memory_order_relaxed);
+        uniRssiN.fetch_add(1, std::memory_order_relaxed);
+        uniRssiLast.store(pkt->rx_ctrl.rssi, std::memory_order_relaxed);
         return;
     }
     if (subtype != 0x08 && subtype != 0x05) return;   // nur Beacon / Probe Resp
@@ -771,6 +785,18 @@ static Level currentLevel() {
 // ---------------------------------------------------------------------
 // Taster
 // ---------------------------------------------------------------------
+// Beacon-RSSI gegen Unicast-Management-RSSI des eigenen AP. Liegen beide
+// zusammen, ist Regel 6 am Standort gültig.
+static void printCalib() {
+    const uint32_t n = uniRssiN.load();
+    for (size_t i = 0; i < WHITELIST_COUNT; i++)
+        if (fp[i].rssiValid)
+            Serial.printf("Kalibrierung %s: Beacon %d dBm", WHITELIST[i].label, fp[i].rssiEma4 / 4);
+    if (n) Serial.printf(", Unicast-Mgmt vom AP %lu Frames, Mittel %ld dBm, zuletzt %d dBm\n",
+                         (unsigned long)n, -(long)(uniRssiSum.load() / n), (int)uniRssiLast.load());
+    else   Serial.println(", noch kein Unicast-Mgmt vom AP gesehen (Auth/Assoc/Action)");
+}
+
 // Gelernte Fingerprints verwerfen (nach Router-Update oder Konfigänderung)
 static void relearnFingerprints() {
     for (size_t i = 0; i < WHITELIST_COUNT; i++) {
@@ -1126,7 +1152,7 @@ void loop() {
     pollButton();
     while (Serial.available()) {
         const char c = (char)Serial.read();
-        if (c == 'd')      { printSavedEvidence(); dumpEvidence("Beweis-Log (RAM)"); }
+        if (c == 'd')      { printSavedEvidence(); dumpEvidence("Beweis-Log (RAM)"); printCalib(); }
         else if (c == 'r') relearnFingerprints();
         else if (c == 'h' || c == '?') Serial.println("d = Beweis-Log, r = Fingerprints neu lernen");
     }
